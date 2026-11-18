@@ -1,0 +1,11 @@
+{
+  "name": "FaceSwap Cam",
+  "description": "Real-time face-swapping and 2D character puppet camera for content creators with landmark mesh warping, One Euro filter smoothing, manual cartoon and animal rig setup, and bilingual Bengali + English studio controls.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

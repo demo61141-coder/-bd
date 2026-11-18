@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">FaceSwap Cam</string>
+    <string name="app_subtitle_bn">ফেসসোয়াপ ক্যাম • রিয়েল-টাইম স্টুডিও</string>
+    <string name="permission_title">ক্যামেরা ও মাইক্রোফোন অনুমতি / Camera &amp; Mic Access</string>
+    <string name="permission_desc">রিয়েল-টাইম ফেস সোয়াপ, অডিওসহ ভিডিও রেকর্ড এবং গ্যালারিতে সেভ করার জন্য ক্যামেরা ও মাইক্রোফোন পারমিশন প্রয়োজন। / Camera and Microphone permissions are required for real-time face mesh warping and recording video with audio.</string>
+    <string name="grant_permission_btn">অনুমতি দিন / Grant Permissions</string>
+    <string name="simulation_mode_btn">সিমুলেশন প্রিভিউ / Try Live Demo Feed</string>
+    <string name="upload_btn_label">আপলোড / Upload</string>
+    <string name="photo_btn_label">ছবি / Photo</string>
+    <string name="record_btn_label">রেকর্ড / Record</string>
+    <string name="stop_btn_label">থামুন / Stop</string>
+    <string name="settings_title">সেটিংস / Studio Settings</string>
+    <string name="guide_title">নির্দেশিকা / Creator Guide</string>
+    <string name="studio_gallery_title">স্টুডিও গ্যালারি / Studio Captures</string>
+    <string name="manual_setup_title">ম্যানুয়াল সেটআপ / Manual Character Rig</string>
+</resources>

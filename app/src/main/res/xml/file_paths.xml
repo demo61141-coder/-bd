@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="studio_captures" path="captures/" />
+    <files-path name="custom_characters" path="characters/" />
+    <cache-path name="shared_media" path="." />
+</paths>
