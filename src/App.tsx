@@ -114,21 +114,34 @@ export const App: React.FC = () => {
     img.src = selectedChar.imageDataUrl;
   }, [selectedChar]);
 
-  // Initialize MediaPipe Face Landmarker (GPU with CPU fallback, lowered thresholds for side profile)
+  // Initialize MediaPipe Face Landmarker — bundled model + wasm first (offline),
+  // CDN as fallback. GPU tried first, CPU if GPU fails. Lowered thresholds for side profile.
   useEffect(() => {
     let cancelled = false;
     async function initMediaPipe() {
-      try {
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-        );
-        let landmarker: FaceLandmarker;
+      const combos: Array<{ wasm: string; model: string; delegate: 'GPU' | 'CPU' }> = [
+        { wasm: 'wasm', model: 'models/face_landmarker.task', delegate: 'GPU' },
+        { wasm: 'wasm', model: 'models/face_landmarker.task', delegate: 'CPU' },
+        {
+          wasm: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm',
+          model: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        {
+          wasm: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm',
+          model: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'CPU'
+        }
+      ];
+      let landmarker: FaceLandmarker | null = null;
+      for (const combo of combos) {
+        if (cancelled) return;
         try {
+          const vision = await FilesetResolver.forVisionTasks(combo.wasm);
           landmarker = await FaceLandmarker.createFromOptions(vision, {
             baseOptions: {
-              modelAssetPath:
-                'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-              delegate: 'GPU'
+              modelAssetPath: combo.model,
+              delegate: combo.delegate
             },
             outputFaceBlendshapes: true,
             runningMode: 'VIDEO',
@@ -137,29 +150,14 @@ export const App: React.FC = () => {
             minFacePresenceConfidence: 0.22,
             minTrackingConfidence: 0.22
           });
+          break;
         } catch {
-          landmarker = await FaceLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath:
-                'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-              delegate: 'CPU'
-            },
-            outputFaceBlendshapes: true,
-            runningMode: 'VIDEO',
-            numFaces: 1,
-            minFaceDetectionConfidence: 0.22,
-            minFacePresenceConfidence: 0.22,
-            minTrackingConfidence: 0.22
-          });
+          // Try the next combo (bundled CPU, then CDN GPU, then CDN CPU).
         }
-        if (!cancelled) {
-          landmarkerRef.current = landmarker;
-          setIsLoadingModel(false);
-        }
-      } catch {
-        if (!cancelled) {
-          setIsLoadingModel(false);
-        }
+      }
+      if (!cancelled) {
+        if (landmarker) landmarkerRef.current = landmarker;
+        setIsLoadingModel(false);
       }
     }
     initMediaPipe();
