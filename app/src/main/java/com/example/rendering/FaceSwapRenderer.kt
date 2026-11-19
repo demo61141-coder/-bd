@@ -64,7 +64,7 @@ object FaceSwapRenderer {
         detailedMouthInterior: Boolean,
         showMeshWireframe: Boolean
     ) {
-        if (viewportWidth <= 1f || viewportHeight <= 1f || characterBitmap.isRecycled) return
+        if (!pose.isTracking || viewportWidth <= 1f || viewportHeight <= 1f || characterBitmap.isRecycled) return
 
         val alphaInt = (blendOpacity.coerceIn(0.05f, 1.0f) * 255).toInt()
         meshPaint.alpha = alphaInt
@@ -211,8 +211,8 @@ object FaceSwapRenderer {
         val texX = FloatArray(numVerts)
         val texY = FloatArray(numVerts)
 
-        // Compute character scale & center on screen aligned to the user's live face
-        val headWidthPx = minOf(vw, vh) * (pose.faceScale * 1.48f)
+        // Compute character scale & center on screen aligned 1:1 to the user's live face
+        val headWidthPx = minOf(vw, vh) * (pose.faceScale * 1.08f)
         val headHeightPx = headWidthPx * (bmpHeight / bmpWidth.coerceAtLeast(1f))
         val nosePivotU = cfg.noseTip.x
         val nosePivotV = cfg.noseTip.y

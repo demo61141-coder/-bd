@@ -218,26 +218,14 @@ class StudioMediaRecorder(private val context: Context) {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
         if (cameraPreviewBitmap != null && !cameraPreviewBitmap.isRecycled) {
-            val scale = maxOf(
-                width / cameraPreviewBitmap.width.coerceAtLeast(1),
-                height / cameraPreviewBitmap.height.coerceAtLeast(1)
-            )
-            val scaledW = cameraPreviewBitmap.width * scale
-            val scaledH = cameraPreviewBitmap.height * scale
-            val dx = (width - scaledW) * 0.5f
-            val dy = (height - scaledH) * 0.5f
-
-            canvas.save()
-            if (isMirrored) {
-                // PreviewView bitmap already matches screen orientation, keep as-is
-            }
+            // cameraPreviewBitmap comes directly from PreviewView.getBitmap(), which already has
+            // the exact viewport aspect ratio and framing matching livePose [0..1] coordinates.
             canvas.drawBitmap(
                 cameraPreviewBitmap,
                 null,
-                RectF(dx, dy, dx + scaledW, dy + scaledH),
+                RectF(0f, 0f, width, height),
                 paint
             )
-            canvas.restore()
         } else {
             // Sleek dark creator studio ambient backdrop when camera feed is in simulation mode
             paint.shader = LinearGradient(

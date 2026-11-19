@@ -1,7 +1,18 @@
 package com.example.tracking
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.PointF
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.RadialGradient
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
 import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
@@ -21,11 +32,12 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.cos
-import kotlin.math. hypot
+import kotlin.math.hypot
 import kotlin.math.sin
 
 sealed class StaticFaceDetectionResult {
     data class HumanFaceDetected(
+        val croppedFaceBitmap: Bitmap,
         val controlPoints: List<Point2D>,
         val puppetConfig: PuppetConfig
     ) : StaticFaceDetectionResult()
@@ -44,7 +56,7 @@ class FaceTrackerEngine(
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.15f)
+            .setMinFaceSize(0.10f)
             .build()
         FaceDetection.getClient(options)
     }
@@ -55,7 +67,7 @@ class FaceTrackerEngine(
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.10f)
+            .setMinFaceSize(0.08f)
             .build()
         FaceDetection.getClient(options)
     }
@@ -66,8 +78,12 @@ class FaceTrackerEngine(
     @Volatile
     var forceDemoMotion: Boolean = false
 
+    @Volatile
+    var viewportAspectRatio: Float = 9f / 16f
+
     private var modelReadyNotified = false
     private var lastFrameTimestampMs = System.currentTimeMillis()
+    private var lastRealFacePose: LiveFacePose? = null
     private var lastRealFaceTimestampMs = 0L
     private var currentFps = 30
 
@@ -100,97 +116,205 @@ class FaceTrackerEngine(
             .addOnSuccessListener { faces ->
                 val primaryFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
                 if (primaryFace != null) {
-                    lastRealFaceTimestampMs = now
                     val pose = mapFaceToLivePose(
                         face = primaryFace,
                         frameWidth = frameWidth.coerceAtLeast(1f),
                         frameHeight = frameHeight.coerceAtLeast(1f),
+                        targetViewportAspect = viewportAspectRatio,
                         mirrorX = isMirrored,
                         fps = currentFps
                     )
+                    lastRealFacePose = pose
+                    lastRealFaceTimestampMs = now
                     onLivePoseDetected(pose)
                 } else {
-                    // If no physical person is in front of the camera (e.g. streaming emulator),
-                    // smoothly animate synthetic expressions so the creator can preview the rig live.
-                    onLivePoseDetected(synthesizeExpressivePose(now, currentFps))
+                    val recent = lastRealFacePose
+                    if (recent != null && (now - lastRealFaceTimestampMs) < 450L) {
+                        onLivePoseDetected(recent.copy(fps = currentFps))
+                    } else {
+                        onLivePoseDetected(
+                            LiveFacePose(
+                                isTracking = false,
+                                fps = currentFps
+                            )
+                        )
+                    }
                 }
             }
             .addOnFailureListener {
-                onLivePoseDetected(synthesizeExpressivePose(now, currentFps))
+                onLivePoseDetected(LiveFacePose(isTracking = false, fps = currentFps))
             }
             .addOnCompleteListener {
                 imageProxy.close()
             }
     }
 
-    /**
-     * Runs static face landmark detection on a user-uploaded gallery image.
-     * If no human face is detected (e.g. cartoon or animal), returns [StaticFaceDetectionResult.NoHumanFaceFound]
-     * so the UI opens the Manual Setup Editor.
-     */
-    suspend fun detectFaceOnStaticBitmap(bitmap: Bitmap): StaticFaceDetectionResult =
-        suspendCancellableCoroutine { cont ->
-            val inputImage = InputImage.fromBitmap(bitmap, 0)
-            staticAccuracyDetector.process(inputImage)
-                .addOnSuccessListener { faces ->
-                    val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-                    if (face == null) {
-                        if (cont.isActive) cont.resume(StaticFaceDetectionResult.NoHumanFaceFound)
-                        return@addOnSuccessListener
-                    }
-                    val w = bitmap.width.toFloat().coerceAtLeast(1f)
-                    val h = bitmap.height.toFloat().coerceAtLeast(1f)
-                    val pose = mapFaceToLivePose(
-                        face = face,
-                        frameWidth = w,
-                        frameHeight = h,
-                        mirrorX = false,
-                        fps = 30
-                    )
-                    val puppet = extractPuppetConfigFromFace(face, w, h)
-                    if (cont.isActive) {
-                        cont.resume(
-                            StaticFaceDetectionResult.HumanFaceDetected(
-                                controlPoints = pose.controlPoints,
-                                puppetConfig = puppet
-                            )
-                        )
-                    }
-                }
-                .addOnFailureListener {
+    suspend fun detectFaceOnStaticBitmap(bitmap: Bitmap): StaticFaceDetectionResult {
+        val firstTry = runStaticDetection(bitmap)
+        if (firstTry is StaticFaceDetectionResult.HumanFaceDetected) {
+            return firstTry
+        }
+        val enhanced = enhanceBitmapContrast(bitmap)
+        return runStaticDetection(enhanced, originalForCrop = bitmap)
+    }
+
+    private suspend fun runStaticDetection(
+        detectBitmap: Bitmap,
+        originalForCrop: Bitmap = detectBitmap
+    ): StaticFaceDetectionResult = suspendCancellableCoroutine { cont ->
+        val inputImage = InputImage.fromBitmap(detectBitmap, 0)
+        staticAccuracyDetector.process(inputImage)
+            .addOnSuccessListener { faces ->
+                val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                if (face == null) {
                     if (cont.isActive) cont.resume(StaticFaceDetectionResult.NoHumanFaceFound)
+                    return@addOnSuccessListener
                 }
-        }
 
-    private fun extractPuppetConfigFromFace(face: Face, w: Float, h: Float): PuppetConfig {
-        val box = face.boundingBox
-        val bx = box.left / w
-        val by = box.top / h
-        val bw = box.width() / w
-        val bh = box.height() / h
+                val croppedResult = cropAndMaskDetectedFace(originalForCrop, face)
 
-        fun normPt(landmarkType: Int, fallbackX: Float, fallbackY: Float): Point2D {
-            val lm = face.getLandmark(landmarkType)?.position
-            return if (lm != null) {
-                Point2D((lm.x / w).coerceIn(0.05f, 0.95f), (lm.y / h).coerceIn(0.05f, 0.95f))
-            } else {
-                Point2D(fallbackX, fallbackY)
+                if (cont.isActive) {
+                    cont.resume(
+                        StaticFaceDetectionResult.HumanFaceDetected(
+                            croppedFaceBitmap = croppedResult.first,
+                            controlPoints = croppedResult.second,
+                            puppetConfig = croppedResult.third
+                        )
+                    )
+                }
             }
+            .addOnFailureListener {
+                if (cont.isActive) cont.resume(StaticFaceDetectionResult.NoHumanFaceFound)
+            }
+    }
+
+    /**
+     * Crops a tight, inner-face 512x512 portrait centered on the detected eyes, nose, and mouth,
+     * and applies a smooth feathered oval alpha mask so the person's background, hair, ears, and
+     * clothing are completely removed and only the inner facial features swap seamlessly.
+     */
+    private fun cropAndMaskDetectedFace(
+        source: Bitmap,
+        face: Face
+    ): Triple<Bitmap, List<Point2D>, PuppetConfig> {
+        val srcW = source.width.toFloat().coerceAtLeast(1f)
+        val srcH = source.height.toFloat().coerceAtLeast(1f)
+        val box: Rect = face.boundingBox
+
+        val cx = box.exactCenterX()
+        val cy = box.exactCenterY()
+        // Tight framing so canonical coordinates [0.18..0.82] align 1:1 with the detected face box
+        val halfSpan = maxOf(box.width(), box.height()) * 0.56f
+
+        val cropLeft = cx - halfSpan
+        val cropTop = cy - halfSpan
+        val cropSize = (halfSpan * 2f).coerceAtLeast(32f)
+
+        val targetSize = 512
+        val croppedOut = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(croppedOut)
+        val scale = targetSize / cropSize
+
+        val dstRect = RectF(
+            -cropLeft * scale,
+            -cropTop * scale,
+            (srcW - cropLeft) * scale,
+            (srcH - cropTop) * scale
+        )
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(source, null, dstRect, paint)
+
+        // Smooth inner-face oval feathering: keeps eyebrows, eyes, nose, cheeks, and lips while
+        // smoothly fading out before the outer hairline, ears, neck, or background.
+        val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+            shader = RadialGradient(
+                targetSize * 0.50f,
+                targetSize * 0.51f,
+                targetSize * 0.37f,
+                intArrayOf(
+                    Color.WHITE,
+                    Color.WHITE,
+                    Color.argb(175, 255, 255, 255),
+                    Color.argb(45, 255, 255, 255),
+                    Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.58f, 0.78f, 0.92f, 1.0f),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.save()
+        canvas.scale(0.88f, 1.08f, targetSize * 0.50f, targetSize * 0.51f)
+        canvas.drawRect(0f, 0f, targetSize.toFloat(), targetSize.toFloat(), maskPaint)
+        canvas.restore()
+
+        val poseInCrop = mapFaceToCroppedSpace(
+            face = face,
+            cropLeft = cropLeft,
+            cropTop = cropTop,
+            cropSize = cropSize
+        )
+        val puppetInCrop = extractPuppetConfigInCrop(
+            face = face,
+            cropLeft = cropLeft,
+            cropTop = cropTop,
+            cropSize = cropSize
+        )
+
+        return Triple(croppedOut, poseInCrop, puppetInCrop)
+    }
+
+    private fun mapFaceToCroppedSpace(
+        face: Face,
+        cropLeft: Float,
+        cropTop: Float,
+        cropSize: Float
+    ): List<Point2D> {
+        fun toCropNorm(pt: PointF): Point2D {
+            val u = ((pt.x - cropLeft) / cropSize).coerceIn(0.04f, 0.96f)
+            val v = ((pt.y - cropTop) / cropSize).coerceIn(0.04f, 0.96f)
+            return Point2D(u, v)
+        }
+        return extract36ControlPointsFromFace(
+            face = face,
+            pointMapper = ::toCropNorm,
+            mirrorX = false,
+            jawOpen = 0.0f,
+            blinkLeft = 0.0f,
+            blinkRight = 0.0f,
+            smile = 0.0f
+        )
+    }
+
+    private fun extractPuppetConfigInCrop(
+        face: Face,
+        cropLeft: Float,
+        cropTop: Float,
+        cropSize: Float
+    ): PuppetConfig {
+        fun lmNorm(type: Int, fbX: Float, fbY: Float): Point2D {
+            val pos = face.getLandmark(type)?.position ?: return Point2D(fbX, fbY)
+            return Point2D(
+                ((pos.x - cropLeft) / cropSize).coerceIn(0.08f, 0.92f),
+                ((pos.y - cropTop) / cropSize).coerceIn(0.08f, 0.92f)
+            )
         }
 
-        val leftEye = normPt(FaceLandmark.LEFT_EYE, bx + bw * 0.32f, by + bh * 0.38f)
-        val rightEye = normPt(FaceLandmark.RIGHT_EYE, bx + bw * 0.68f, by + bh * 0.38f)
-        val nose = normPt(FaceLandmark.NOSE_BASE, bx + bw * 0.50f, by + bh * 0.54f)
-        val mouthLeft = normPt(FaceLandmark.MOUTH_LEFT, bx + bw * 0.35f, by + bh * 0.72f)
-        val mouthRight = normPt(FaceLandmark.MOUTH_RIGHT, bx + bw * 0.65f, by + bh * 0.72f)
-        val mouthBottom = normPt(FaceLandmark.MOUTH_BOTTOM, bx + bw * 0.50f, by + bh * 0.78f)
+        val rawEyeA = lmNorm(FaceLandmark.LEFT_EYE, 0.36f, 0.40f)
+        val rawEyeB = lmNorm(FaceLandmark.RIGHT_EYE, 0.64f, 0.40f)
+        val leftEye = if (rawEyeA.x <= rawEyeB.x) rawEyeA else rawEyeB
+        val rightEye = if (rawEyeA.x <= rawEyeB.x) rawEyeB else rawEyeA
 
-        val eyeHalfW = (abs(rightEye.x - leftEye.x) * 0.32f).coerceIn(0.06f, 0.14f)
-        val eyeHalfH = (eyeHalfW * 0.65f).coerceIn(0.04f, 0.10f)
+        val nose = lmNorm(FaceLandmark.NOSE_BASE, 0.50f, 0.53f)
 
-        val mouthHalfH = (abs(mouthBottom.y - (mouthLeft.y + mouthRight.y) * 0.5f) * 1.4f)
-            .coerceIn(0.05f, 0.12f)
-        val mouthCenterY = (mouthLeft.y + mouthRight.y) * 0.5f
+        val rawMouthA = lmNorm(FaceLandmark.MOUTH_LEFT, 0.38f, 0.67f)
+        val rawMouthB = lmNorm(FaceLandmark.MOUTH_RIGHT, 0.62f, 0.67f)
+        val mouthLeft = if (rawMouthA.x <= rawMouthB.x) rawMouthA else rawMouthB
+        val mouthRight = if (rawMouthA.x <= rawMouthB.x) rawMouthB else rawMouthA
+
+        val eyeHalfW = (abs(rightEye.x - leftEye.x) * 0.30f).coerceIn(0.06f, 0.13f)
+        val eyeHalfH = (eyeHalfW * 0.62f).coerceIn(0.04f, 0.08f)
+        val mouthCY = (mouthLeft.y + mouthRight.y) * 0.5f
 
         return PuppetConfig(
             leftEye = leftEye,
@@ -199,22 +323,22 @@ class FaceTrackerEngine(
             mouthLeft = mouthLeft,
             mouthRight = mouthRight,
             leftEyeBox = NormalizedBox(
-                left = (leftEye.x - eyeHalfW).coerceIn(0.05f, 0.90f),
-                top = (leftEye.y - eyeHalfH).coerceIn(0.05f, 0.90f),
-                right = (leftEye.x + eyeHalfW).coerceIn(0.10f, 0.95f),
-                bottom = (leftEye.y + eyeHalfH).coerceIn(0.10f, 0.95f)
+                (leftEye.x - eyeHalfW).coerceIn(0.05f, 0.90f),
+                (leftEye.y - eyeHalfH).coerceIn(0.05f, 0.90f),
+                (leftEye.x + eyeHalfW).coerceIn(0.10f, 0.95f),
+                (leftEye.y + eyeHalfH).coerceIn(0.10f, 0.95f)
             ),
             rightEyeBox = NormalizedBox(
-                left = (rightEye.x - eyeHalfW).coerceIn(0.05f, 0.90f),
-                top = (rightEye.y - eyeHalfH).coerceIn(0.05f, 0.90f),
-                right = (rightEye.x + eyeHalfW).coerceIn(0.10f, 0.95f),
-                bottom = (rightEye.y + eyeHalfH).coerceIn(0.10f, 0.95f)
+                (rightEye.x - eyeHalfW).coerceIn(0.05f, 0.90f),
+                (rightEye.y - eyeHalfH).coerceIn(0.05f, 0.90f),
+                (rightEye.x + eyeHalfW).coerceIn(0.10f, 0.95f),
+                (rightEye.y + eyeHalfH).coerceIn(0.10f, 0.95f)
             ),
             mouthBox = NormalizedBox(
-                left = (minOf(mouthLeft.x, mouthRight.x) - 0.03f).coerceIn(0.05f, 0.90f),
-                top = (mouthCenterY - mouthHalfH * 0.8f).coerceIn(0.05f, 0.90f),
-                right = (maxOf(mouthLeft.x, mouthRight.x) + 0.03f).coerceIn(0.10f, 0.95f),
-                bottom = (mouthCenterY + mouthHalfH * 1.2f).coerceIn(0.10f, 0.95f)
+                (minOf(mouthLeft.x, mouthRight.x) - 0.03f).coerceIn(0.05f, 0.90f),
+                (mouthCY - 0.05f).coerceIn(0.05f, 0.90f),
+                (maxOf(mouthLeft.x, mouthRight.x) + 0.03f).coerceIn(0.10f, 0.95f),
+                (mouthCY + 0.07f).coerceIn(0.10f, 0.95f)
             )
         )
     }
@@ -223,25 +347,52 @@ class FaceTrackerEngine(
         face: Face,
         frameWidth: Float,
         frameHeight: Float,
+        targetViewportAspect: Float,
         mirrorX: Boolean,
         fps: Int
     ): LiveFacePose {
-        fun norm(pt: PointF): Point2D {
-            val rawX = (pt.x / frameWidth).coerceIn(0.01f, 0.99f)
-            val x = if (mirrorX) 1.0f - rawX else rawX
-            val y = (pt.y / frameHeight).coerceIn(0.01f, 0.99f)
+        val frameAspect = frameWidth / frameHeight.coerceAtLeast(1f)
+        val viewAspect = targetViewportAspect.coerceAtLeast(0.2f)
+
+        // FIT_CENTER / natural camera framing mapping so coordinates match the un-zoomed camera preview
+        val scaleToView: Float
+        val padX: Float
+        val padY: Float
+
+        if (frameAspect > viewAspect) {
+            // Frame is wider than view (or fills width in FIT_CENTER)
+            scaleToView = 1f / frameWidth
+            val drawnH = frameHeight * scaleToView * viewAspect
+            padX = 0f
+            padY = (1f - drawnH) * 0.5f
+        } else {
+            scaleToView = 1f / frameHeight
+            val drawnW = frameWidth * scaleToView / viewAspect
+            padX = (1f - drawnW) * 0.5f
+            padY = 0f
+        }
+
+        // Note: PreviewView with ScaleType.FIT_CENTER centers the un-zoomed 4:3 camera stream
+        fun mapToViewport(pt: PointF): Point2D {
+            val normXInFrame = pt.x / frameWidth
+            val normYInFrame = pt.y / frameHeight
+            val mirroredFrameX = if (mirrorX) 1.0f - normXInFrame else normXInFrame
+
+            val drawnW = 1f - 2f * padX
+            val drawnH = 1f - 2f * padY
+            val x = padX + mirroredFrameX * drawnW
+            val y = padY + normYInFrame * drawnH
             return Point2D(x, y)
         }
 
         val box = face.boundingBox
-        val rawCenterX = (box.exactCenterX() / frameWidth).coerceIn(0.1f, 0.9f)
-        val centerX = if (mirrorX) 1f - rawCenterX else rawCenterX
-        val centerY = (box.exactCenterY() / frameHeight).coerceIn(0.1f, 0.9f)
-        val scaleX = (box.width() / frameWidth).coerceIn(0.22f, 0.92f)
-        val scaleY = (box.height() / frameHeight).coerceIn(0.22f, 0.92f)
-        val faceScale = ((scaleX + scaleY) * 0.5f).coerceIn(0.28f, 0.88f)
+        val centerPt = mapToViewport(PointF(box.exactCenterX(), box.exactCenterY()))
+        val topLeftPt = mapToViewport(PointF(box.left.toFloat(), box.top.toFloat()))
+        val bottomRightPt = mapToViewport(PointF(box.right.toFloat(), box.bottom.toFloat()))
+        val scaleX = abs(bottomRightPt.x - topLeftPt.x).coerceIn(0.10f, 0.85f)
+        val scaleY = abs(bottomRightPt.y - topLeftPt.y).coerceIn(0.10f, 0.85f)
+        val faceScale = ((scaleX + scaleY) * 0.5f).coerceIn(0.12f, 0.85f)
 
-        // Extract blendshapes
         val leftOpenProb = face.leftEyeOpenProbability ?: 0.92f
         val rightOpenProb = face.rightEyeOpenProbability ?: 0.92f
         val rawBlinkLeft = (1f - leftOpenProb).coerceIn(0f, 1f)
@@ -251,34 +402,28 @@ class FaceTrackerEngine(
 
         val smile = (face.smilingProbability ?: 0.15f).coerceIn(0f, 1f)
 
-        // Compute jawOpen from inner lip contours if available
         val upperLipBottom = face.getContour(FaceContour.UPPER_LIP_BOTTOM)?.points
         val lowerLipTop = face.getContour(FaceContour.LOWER_LIP_TOP)?.points
         val jawOpenFromContour = if (!upperLipBottom.isNullOrEmpty() && !lowerLipTop.isNullOrEmpty()) {
             val uMid = upperLipBottom[upperLipBottom.size / 2]
             val lMid = lowerLipTop[lowerLipTop.size / 2]
             val mouthGap = abs(lMid.y - uMid.y)
-            val normalizedGap = mouthGap / (box.height().coerceAtLeast(1).toFloat() * 0.22f)
-            (normalizedGap - 0.06f).coerceIn(0f, 1f)
+            val normalizedGap = mouthGap / (box.height().coerceAtLeast(1).toFloat() * 0.20f)
+            (normalizedGap - 0.05f).coerceIn(0f, 1f)
         } else {
-            0.05f
+            0.04f
         }
 
         val yaw = if (mirrorX) -face.headEulerAngleY else face.headEulerAngleY
         val pitch = face.headEulerAngleX
         val roll = if (mirrorX) -face.headEulerAngleZ else face.headEulerAngleZ
 
-        // Collect all contour points for dense visualization
-        val allContours = face.allContours.flatMap { it.points }.map(::norm)
+        val allContours = face.allContours.flatMap { it.points }.map(::mapToViewport)
 
-        // Map canonical 36 control points onto the user's live face geometry, head pose, and expressions
-        val controlPoints = transformCanonicalControlPoints(
-            centerX = centerX,
-            centerY = centerY,
-            scale = faceScale * 1.15f,
-            yawDeg = yaw,
-            pitchDeg = pitch,
-            rollDeg = roll,
+        val controlPoints = extract36ControlPointsFromFace(
+            face = face,
+            pointMapper = ::mapToViewport,
+            mirrorX = mirrorX,
             jawOpen = jawOpenFromContour,
             blinkLeft = eyeBlinkLeft,
             blinkRight = eyeBlinkRight,
@@ -298,27 +443,151 @@ class FaceTrackerEngine(
             yawDegrees = yaw,
             pitchDegrees = pitch,
             rollDegrees = roll,
-            faceCenterX = centerX,
-            faceCenterY = centerY,
+            faceCenterX = centerPt.x,
+            faceCenterY = centerPt.y,
             faceScale = faceScale,
             fps = fps
         )
     }
 
     /**
-     * Synthesizes natural, expressive facial motion (smooth head sway, periodic blinking,
-     * and conversational jaw movement) when testing in an emulator without a live person
-     * in front of the camera or when Demo Motion mode is enabled.
+     * Extracts the 36 Delaunay mesh vertices anchored strictly to the real detected eyes, nose,
+     * mouth, eyebrows, and face perimeter without any artificial enlargement.
      */
+    private fun extract36ControlPointsFromFace(
+        face: Face,
+        pointMapper: (PointF) -> Point2D,
+        mirrorX: Boolean,
+        jawOpen: Float,
+        blinkLeft: Float,
+        blinkRight: Float,
+        smile: Float
+    ): List<Point2D> {
+        val box = face.boundingBox
+        val centerMapped = pointMapper(PointF(box.exactCenterX(), box.exactCenterY()))
+        val topLeftMapped = pointMapper(PointF(box.left.toFloat(), box.top.toFloat()))
+        val bottomRightMapped = pointMapper(PointF(box.right.toFloat(), box.bottom.toFloat()))
+
+        // Use exact 1:1 face bounding box proportions (no 1.38x zoom/inflation!)
+        var boxW = abs(bottomRightMapped.x - topLeftMapped.x).coerceAtLeast(0.08f)
+        var boxH = abs(bottomRightMapped.y - topLeftMapped.y).coerceAtLeast(0.08f)
+
+        // Refine center and scale from actual eye-to-eye and eye-to-mouth distances if available
+        val rawEye1 = face.getLandmark(FaceLandmark.LEFT_EYE)?.position?.let(pointMapper)
+        val rawEye2 = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position?.let(pointMapper)
+        val screenLeftEye = if (rawEye1 != null && rawEye2 != null) {
+            if (rawEye1.x <= rawEye2.x) rawEye1 else rawEye2
+        } else null
+        val screenRightEye = if (rawEye1 != null && rawEye2 != null) {
+            if (rawEye1.x <= rawEye2.x) rawEye2 else rawEye1
+        } else null
+
+        if (screenLeftEye != null && screenRightEye != null) {
+            // In canonical topology, eye centers are at x=0.36 and x=0.64 (span = 0.28 of canonical width 0.64)
+            val interEyeDist = hypot(screenRightEye.x - screenLeftEye.x, screenRightEye.y - screenLeftEye.y)
+            if (interEyeDist > 0.02f) {
+                boxW = (interEyeDist / 0.44f).coerceIn(boxW * 0.70f, boxW * 1.05f)
+            }
+        }
+
+        val yaw = if (mirrorX) -face.headEulerAngleY else face.headEulerAngleY
+        val pitch = face.headEulerAngleX
+        val roll = if (mirrorX) -face.headEulerAngleZ else face.headEulerAngleZ
+
+        val projected = transformCanonicalToBox(
+            centerX = centerMapped.x,
+            centerY = centerMapped.y,
+            boxWidth = boxW * 0.94f,
+            boxHeight = boxH * 0.94f,
+            yawDeg = yaw,
+            pitchDeg = pitch,
+            rollDeg = roll,
+            jawOpen = jawOpen,
+            blinkLeft = blinkLeft,
+            blinkRight = blinkRight,
+            smile = smile
+        ).toMutableList()
+
+        // Lock left eye diamond (vertices 9..12) to real screen-left eye
+        if (screenLeftEye != null) {
+            val ew = boxW * 0.105f
+            val eh = boxH * 0.042f * (1f - blinkLeft * 0.75f)
+            projected[9] = Point2D(screenLeftEye.x - ew, screenLeftEye.y)
+            projected[10] = Point2D(screenLeftEye.x, screenLeftEye.y - eh)
+            projected[11] = Point2D(screenLeftEye.x + ew, screenLeftEye.y)
+            projected[12] = Point2D(screenLeftEye.x, screenLeftEye.y + eh)
+        }
+
+        // Lock right eye diamond (vertices 13..16) to real screen-right eye
+        if (screenRightEye != null) {
+            val ew = boxW * 0.105f
+            val eh = boxH * 0.042f * (1f - blinkRight * 0.75f)
+            projected[13] = Point2D(screenRightEye.x - ew, screenRightEye.y)
+            projected[14] = Point2D(screenRightEye.x, screenRightEye.y - eh)
+            projected[15] = Point2D(screenRightEye.x + ew, screenRightEye.y)
+            projected[16] = Point2D(screenRightEye.x, screenRightEye.y + eh)
+        }
+
+        // Lock nose tip & nostrils (vertices 18..20)
+        face.getLandmark(FaceLandmark.NOSE_BASE)?.position?.let { nosePos ->
+            val np = pointMapper(nosePos)
+            projected[18] = np
+            projected[19] = Point2D(np.x - boxW * 0.085f, np.y + boxH * 0.018f)
+            projected[20] = Point2D(np.x + boxW * 0.085f, np.y + boxH * 0.018f)
+        }
+
+        // Lock mouth corners & upper/lower lips (vertices 25..30) sorted by screen X!
+        val rawM1 = face.getLandmark(FaceLandmark.MOUTH_LEFT)?.position?.let(pointMapper)
+        val rawM2 = face.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position?.let(pointMapper)
+        val screenMouthLeft = if (rawM1 != null && rawM2 != null) {
+            if (rawM1.x <= rawM2.x) rawM1 else rawM2
+        } else null
+        val screenMouthRight = if (rawM1 != null && rawM2 != null) {
+            if (rawM1.x <= rawM2.x) rawM2 else rawM1
+        } else null
+        val rawMouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM)?.position?.let(pointMapper)
+
+        if (screenMouthLeft != null && screenMouthRight != null) {
+            val midX = (screenMouthLeft.x + screenMouthRight.x) * 0.5f
+            val midY = (screenMouthLeft.y + screenMouthRight.y) * 0.5f
+            val mb = rawMouthBottom ?: Point2D(midX, midY + boxH * (0.055f + jawOpen * 0.11f))
+
+            projected[25] = screenMouthLeft
+            projected[27] = screenMouthRight
+            projected[26] = Point2D(midX, midY - boxH * 0.038f)
+            projected[29] = Point2D(midX, midY - boxH * 0.008f)
+            projected[30] = Point2D(midX, midY + boxH * (0.014f + jawOpen * 0.095f))
+            projected[28] = Point2D(mb.x, maxOf(mb.y, midY + boxH * (0.042f + jawOpen * 0.105f)))
+        }
+
+        return projected
+    }
+
+    private fun enhanceBitmapContrast(src: Bitmap): Bitmap {
+        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val cm = ColorMatrix(
+            floatArrayOf(
+                1.25f, 0f, 0f, 0f, 22f,
+                0f, 1.25f, 0f, 0f, 22f,
+                0f, 0f, 1.25f, 0f, 22f,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(cm)
+        }
+        canvas.drawBitmap(src, 0f, 0f, paint)
+        return out
+    }
+
     fun synthesizeExpressivePose(nowMs: Long, fps: Int = 30): LiveFacePose {
         val t = nowMs / 1000.0
         val yaw = (sin(t * 0.9) * 11.0).toFloat()
         val pitch = (cos(t * 0.65) * 6.5).toFloat()
         val roll = (sin(t * 0.55) * 5.5).toFloat()
 
-        // Conversational mouth open rhythm
         val talkWave = ((sin(t * 3.4) + sin(t * 5.7) * 0.5 + 0.4) * 0.42).toFloat().coerceIn(0f, 0.88f)
-        // Natural blink every ~3.4 seconds
         val blinkPhase = (t % 3.4)
         val blink = if (blinkPhase in 0.0..0.18) {
             sin((blinkPhase / 0.18) * Math.PI).toFloat().coerceIn(0f, 1f)
@@ -327,12 +596,13 @@ class FaceTrackerEngine(
         val smile = ((sin(t * 0.8) + 1.0) * 0.35).toFloat().coerceIn(0.05f, 0.75f)
         val cx = 0.50f + (sin(t * 0.6) * 0.025f).toFloat()
         val cy = 0.46f + (cos(t * 0.7) * 0.020f).toFloat()
-        val scale = 0.58f
+        val scale = 0.44f
 
-        val controlPoints = transformCanonicalControlPoints(
+        val controlPoints = transformCanonicalToBox(
             centerX = cx,
             centerY = cy,
-            scale = scale,
+            boxWidth = scale,
+            boxHeight = scale * 0.78f,
             yawDeg = yaw,
             pitchDeg = pitch,
             rollDeg = roll,
@@ -363,14 +633,11 @@ class FaceTrackerEngine(
     }
 
     companion object {
-        /**
-         * Warps the 36 canonical mesh vertices using live head pose (yaw, pitch, roll)
-         * and expression blendshapes (jawOpen, eyeBlinkLeft, eyeBlinkRight, smile).
-         */
-        fun transformCanonicalControlPoints(
+        fun transformCanonicalToBox(
             centerX: Float,
             centerY: Float,
-            scale: Float,
+            boxWidth: Float,
+            boxHeight: Float,
             yawDeg: Float,
             pitchDeg: Float,
             rollDeg: Float,
@@ -390,19 +657,14 @@ class FaceTrackerEngine(
                 var lx = pt.x - 0.50f
                 var ly = pt.y - 0.50f
 
-                // Apply expression deformations in local canonical space:
-                // 1. Eyebrows raise slightly with jawOpen/smile
                 if (idx in 5..8) {
                     ly -= (jawOpen * 0.018f + smile * 0.012f)
                 }
-                // 2. Left eye blink squashes top (10) and bottom (12) eyelids toward eye center
                 if (idx == 10) ly += blinkLeft * 0.026f
                 if (idx == 12) ly -= blinkLeft * 0.020f
-                // 3. Right eye blink squashes top (14) and bottom (16) eyelids toward eye center
                 if (idx == 14) ly += blinkRight * 0.026f
                 if (idx == 16) ly -= blinkRight * 0.020f
 
-                // 4. Mouth corners widen & lift with smile
                 if (idx == 25) {
                     lx -= smile * 0.024f
                     ly -= smile * 0.016f
@@ -412,7 +674,6 @@ class FaceTrackerEngine(
                     ly -= smile * 0.016f
                 }
 
-                // 5. Jaw open moves lower lip (28, 30) and chin (32, 33, 34) downward
                 when (idx) {
                     29 -> ly -= jawOpen * 0.008f
                     30 -> ly += jawOpen * 0.068f
@@ -421,18 +682,19 @@ class FaceTrackerEngine(
                     33 -> ly += jawOpen * 0.058f
                 }
 
-                // 6. 3D foreshortening for yaw and pitch
                 val depthFactor = 1f - abs(lx) * 0.35f
                 lx += yawShift * 0.14f * depthFactor
                 ly += pitchShift * 0.11f * depthFactor
 
-                // 7. Roll rotation + scale + translation to live face center
-                val rx = (lx * cosR - ly * sinR) * (scale / 0.58f)
-                val ry = (lx * sinR + ly * cosR) * (scale / 0.58f)
+                val scaledX = lx * (boxWidth / 0.64f)
+                val scaledY = ly * (boxHeight / 0.70f)
+
+                val rx = scaledX * cosR - scaledY * sinR
+                val ry = scaledX * sinR + scaledY * cosR
 
                 Point2D(
-                    x = (centerX + rx).coerceIn(0.01f, 0.99f),
-                    y = (centerY + ry).coerceIn(0.01f, 0.99f)
+                    x = (centerX + rx).coerceIn(-0.1f, 1.1f),
+                    y = (centerY + ry).coerceIn(-0.1f, 1.1f)
                 )
             }
         }

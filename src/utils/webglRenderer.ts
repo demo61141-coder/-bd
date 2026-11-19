@@ -2,9 +2,109 @@ import { CharacterItem, LiveBlendshapes, Point2D } from '../types';
 import { CANONICAL_36_POINTS, MESH_TRIANGLES } from './demoCharacters';
 
 /**
- * Renders the live camera video frame, triangulated mesh warp (for AUTO_MESH)
- * or 2D puppet grid deformation (for MANUAL_PUPPET), and dark mouth interior
- * with optional teeth/tongue details.
+ * Computes the un-zoomed natural camera placement rectangle on the canvas
+ * so the camera stream is never excessively zoomed or double-cropped.
+ */
+export function computeVideoDrawRect(
+  canvasW: number,
+  canvasH: number,
+  videoW: number,
+  videoH: number
+): { drawX: number; drawY: number; drawW: number; drawH: number } {
+  if (videoW <= 0 || videoH <= 0) {
+    return { drawX: 0, drawY: 0, drawW: canvasW, drawH: canvasH };
+  }
+  // Use fit-width with gentle vertical centering (or at most 1.08x fill) so a 4:3 phone camera
+  // stream shows its full natural width and background just like the native phone camera app!
+  const fitWidthScale = canvasW / videoW;
+  const coverScale = Math.max(canvasW / videoW, canvasH / videoH);
+  // Blend toward fitWidthScale so horizontal field-of-view is preserved without zooming in
+  const scale = Math.min(coverScale, fitWidthScale * 1.12);
+  const drawW = videoW * scale;
+  const drawH = videoH * scale;
+  const drawX = (canvasW - drawW) * 0.5;
+  const drawY = (canvasH - drawH) * 0.5;
+  return { drawX, drawY, drawW, drawH };
+}
+
+/**
+ * Crops & feather-masks an uploaded human photo strictly around the inner facial features
+ * (eyebrows, eyes, nose, cheeks, lips, chin) so passport backgrounds, hair, ears, and clothing
+ * are completely removed and the face blends seamlessly at 1:1 scale.
+ */
+export function createFaceCutoutFromLandmarks(
+  img: HTMLImageElement,
+  lm478: { x: number; y: number }[],
+  indices36: number[]
+): { dataUrl: string; landmarks36: Point2D[] } {
+  const w = img.naturalWidth || img.width || 512;
+  const h = img.naturalHeight || img.height || 512;
+
+  let minX = 1, minY = 1, maxX = 0, maxY = 0;
+  for (const pt of lm478) {
+    if (pt.x < minX) minX = pt.x;
+    if (pt.y < minY) minY = pt.y;
+    if (pt.x > maxX) maxX = pt.x;
+    if (pt.y > maxY) maxY = pt.y;
+  }
+
+  const cx = ((minX + maxX) * 0.5) * w;
+  const cy = ((minY + maxY) * 0.5) * h;
+  const faceW = (maxX - minX) * w;
+  const faceH = (maxY - minY) * h;
+  // Tight framing so inner facial landmarks fit cleanly without oversized edges
+  const halfSpan = Math.max(faceW, faceH) * 0.56;
+
+  const cropLeft = cx - halfSpan;
+  const cropTop = cy - halfSpan;
+  const cropSize = Math.max(32, halfSpan * 2);
+
+  const outSize = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width = outSize;
+  canvas.height = outSize;
+  const ctx = canvas.getContext('2d')!;
+
+  const scale = outSize / cropSize;
+  ctx.drawImage(img, -cropLeft * scale, -cropTop * scale, w * scale, h * scale);
+
+  // Soft inner-face oval alpha mask: keeps brows, eyes, nose, cheeks, and mouth while
+  // smoothly fading out before the outer hairline, ears, or background.
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.translate(outSize * 0.5, outSize * 0.51);
+  ctx.scale(0.86, 1.06);
+  const grad = ctx.createRadialGradient(0, 0, outSize * 0.20, 0, 0, outSize * 0.40);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.62, 'rgba(255,255,255,0.98)');
+  grad.addColorStop(0.82, 'rgba(255,255,255,0.55)');
+  grad.addColorStop(0.94, 'rgba(255,255,255,0.12)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(0, 0, outSize * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  const landmarks36: Point2D[] = indices36.map((mpIdx) => {
+    const pt = lm478[mpIdx] || { x: 0.5, y: 0.5 };
+    const px = pt.x * w;
+    const py = pt.y * h;
+    return {
+      x: Math.min(0.96, Math.max(0.04, (px - cropLeft) / cropSize)),
+      y: Math.min(0.96, Math.max(0.04, (py - cropTop) / cropSize))
+    };
+  });
+
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    landmarks36
+  };
+}
+
+/**
+ * Renders the live camera video frame (at natural un-zoomed field of view) and warps
+ * the selected character's face mesh 1:1 onto the live tracked face.
  */
 export function renderCompositeCanvasFrame(
   ctx: CanvasRenderingContext2D,
@@ -13,6 +113,7 @@ export function renderCompositeCanvasFrame(
   videoEl: HTMLVideoElement | null,
   characterImg: HTMLImageElement | null,
   character: CharacterItem,
+  isFaceTracked: boolean,
   livePoints36: Point2D[],
   blendshapes: LiveBlendshapes,
   blendOpacity: number,
@@ -20,21 +121,21 @@ export function renderCompositeCanvasFrame(
   detailedMouthInterior: boolean,
   showWireframe: boolean
 ) {
-  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#090A0F';
+  ctx.fillRect(0, 0, width, height);
 
-  // 1. Draw Live Camera Video Frame
-  if (videoEl && videoEl.readyState >= 2) {
+  // 1. Draw Live Camera Video Frame at natural un-zoomed scale
+  if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
+    const vw = videoEl.videoWidth;
+    const vh = videoEl.videoHeight;
+    const { drawX, drawY, drawW, drawH } = computeVideoDrawRect(width, height, vw, vh);
+
     ctx.save();
     if (isMirrored) {
       ctx.translate(width, 0);
       ctx.scale(-1, 1);
     }
-    const vw = videoEl.videoWidth || width;
-    const vh = videoEl.videoHeight || height;
-    const scale = Math.max(width / vw, height / vh);
-    const dw = vw * scale;
-    const dh = vh * scale;
-    ctx.drawImage(videoEl, (width - dw) * 0.5, (height - dh) * 0.5, dw, dh);
+    ctx.drawImage(videoEl, drawX, drawY, drawW, drawH);
     ctx.restore();
   } else {
     const grad = ctx.createRadialGradient(width * 0.5, height * 0.45, 20, width * 0.5, height * 0.5, width * 0.8);
@@ -44,13 +145,48 @@ export function renderCompositeCanvasFrame(
     ctx.fillRect(0, 0, width, height);
   }
 
-  if (!characterImg || !characterImg.complete) return;
+  if (!isFaceTracked || !characterImg || !characterImg.complete || characterImg.naturalWidth === 0) {
+    return;
+  }
 
+  drawWarpedCharacterOverlay(
+    ctx,
+    width,
+    height,
+    characterImg,
+    character,
+    livePoints36,
+    blendshapes,
+    blendOpacity,
+    detailedMouthInterior,
+    showWireframe
+  );
+}
+
+/**
+ * Renders a single warped character face (478-landmark triangulation mesh or 2D puppet grid)
+ * onto an existing canvas context. Can be called multiple times per frame for multi-face video swaps!
+ */
+export function drawWarpedCharacterOverlay(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  characterImg: HTMLImageElement,
+  character: CharacterItem,
+  livePoints36: Point2D[],
+  blendshapes: LiveBlendshapes,
+  blendOpacity: number,
+  detailedMouthInterior: boolean,
+  showWireframe: boolean
+) {
   ctx.save();
   ctx.globalAlpha = Math.min(Math.max(blendOpacity, 0.1), 1.0);
 
   if (character.rigType === 'AUTO_MESH') {
     const srcPts = character.landmarks && character.landmarks.length === 36 ? character.landmarks : CANONICAL_36_POINTS;
+    const imgW = characterImg.naturalWidth || characterImg.width;
+    const imgH = characterImg.naturalHeight || characterImg.height;
+
     for (let i = 0; i < MESH_TRIANGLES.length; i += 3) {
       const i0 = MESH_TRIANGLES[i];
       const i1 = MESH_TRIANGLES[i + 1];
@@ -63,9 +199,9 @@ export function renderCompositeCanvasFrame(
       drawTexturedTriangle(
         ctx,
         characterImg,
-        s0.x * characterImg.width, s0.y * characterImg.height,
-        s1.x * characterImg.width, s1.y * characterImg.height,
-        s2.x * characterImg.width, s2.y * characterImg.height,
+        s0.x * imgW, s0.y * imgH,
+        s1.x * imgW, s1.y * imgH,
+        s2.x * imgW, s2.y * imgH,
         d0.x * width, d0.y * height,
         d1.x * width, d1.y * height,
         d2.x * width, d2.y * height
@@ -88,7 +224,6 @@ export function renderCompositeCanvasFrame(
       );
     }
   } else {
-    // 2D Puppet Grid Warp for Cartoon & Animal Faces
     render2DPuppetGrid(
       ctx,
       width,
@@ -102,8 +237,8 @@ export function renderCompositeCanvasFrame(
   }
 
   if (showWireframe) {
-    ctx.strokeStyle = 'rgba(0, 229, 255, 0.65)';
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = 'rgba(0, 229, 255, 0.72)';
+    ctx.lineWidth = 1.4;
     for (let i = 0; i < MESH_TRIANGLES.length; i += 3) {
       const p0 = livePoints36[MESH_TRIANGLES[i]];
       const p1 = livePoints36[MESH_TRIANGLES[i + 1]];
@@ -133,9 +268,10 @@ function render2DPuppetGrid(
 ) {
   const cfg = character.puppetConfig;
   const noseLive = livePoints36[18] || { x: 0.5, y: 0.5 };
-  const leftTemple = livePoints36[21] || { x: 0.2, y: 0.4 };
-  const rightTemple = livePoints36[22] || { x: 0.8, y: 0.4 };
-  const headWidth = Math.hypot((rightTemple.x - leftTemple.x) * width, (rightTemple.y - leftTemple.y) * height) * 1.65;
+  const leftTemple = livePoints36[21] || { x: 0.25, y: 0.4 };
+  const rightTemple = livePoints36[22] || { x: 0.75, y: 0.4 };
+  // Exact 1.12x temple-to-temple width so 2D puppet fits the head naturally without looking huge
+  const headWidth = Math.hypot((rightTemple.x - leftTemple.x) * width, (rightTemple.y - leftTemple.y) * height) * 1.12;
   const headHeight = headWidth;
 
   const cx = noseLive.x * width;
@@ -146,6 +282,9 @@ function render2DPuppetGrid(
   const yawShift = Math.max(-0.4, Math.min(0.4, blendshapes.yaw / 45));
   const pitchShift = Math.max(-0.35, Math.min(0.35, blendshapes.pitch / 45));
 
+  const imgW = img.naturalWidth || img.width;
+  const imgH = img.naturalHeight || img.height;
+
   const cols = 7;
   const rows = 7;
   const grid: { sx: number; sy: number; dx: number; dy: number }[][] = [];
@@ -155,10 +294,9 @@ function render2DPuppetGrid(
     for (let c = 0; c <= cols; c++) {
       const u = c / cols;
       const v = r / rows;
-      let du = u;
+      const du = u;
       let dv = v;
 
-      // Eye blink vertical squash inside leftEyeBox & rightEyeBox
       const lBox = cfg.leftEyeBox;
       const lCx = (lBox.left + lBox.right) * 0.5;
       const lCy = (lBox.top + lBox.bottom) * 0.5;
@@ -175,7 +313,6 @@ function render2DPuppetGrid(
         dv += (rCy - v) * blendshapes.eyeBlinkRight * 0.85 * (1 - rDist / 0.85);
       }
 
-      // Jaw open downward displacement in lower mouthBox
       const mBox = cfg.mouthBox;
       const mCx = (mBox.left + mBox.right) * 0.5;
       const mCy = (mBox.top + mBox.bottom) * 0.5;
@@ -186,14 +323,14 @@ function render2DPuppetGrid(
         }
       }
 
-      let lx = (du - cfg.noseTip.x) * headWidth + yawShift * headWidth * 0.18;
-      let ly = (dv - cfg.noseTip.y) * headHeight + pitchShift * headHeight * 0.14;
+      const lx = (du - cfg.noseTip.x) * headWidth + yawShift * headWidth * 0.18;
+      const ly = (dv - cfg.noseTip.y) * headHeight + pitchShift * headHeight * 0.14;
       const rx = lx * cosR - ly * sinR;
       const ry = lx * sinR + ly * cosR;
 
       rowArr.push({
-        sx: u * img.width,
-        sy: v * img.height,
+        sx: u * imgW,
+        sy: v * imgH,
         dx: cx + rx,
         dy: cy + ry
       });
@@ -261,13 +398,11 @@ function drawOpenMouthCavity(
     const mw = Math.hypot(rightX - leftX, rightY - leftY);
     const mh = Math.hypot(bottomX - topX, bottomY - topY);
 
-    // Tongue
     ctx.fillStyle = '#D94668';
     ctx.beginPath();
     ctx.ellipse(bottomX, topY + mh * 0.72, mw * 0.32, mh * 0.38, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Upper teeth
     ctx.fillStyle = '#F1F5F9';
     ctx.fillRect(leftX + mw * 0.14, topY - mh * 0.08, mw * 0.72, mh * 0.26);
   }

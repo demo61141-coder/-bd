@@ -50,6 +50,7 @@ import com.example.ui.components.ManualSetupSheet
 import com.example.ui.components.SettingsSheet
 import com.example.ui.components.StudioGallerySheet
 import com.example.ui.components.TopStudioHud
+import com.example.ui.components.VideoSwapStudioSheet
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.StudioObsidian
@@ -89,6 +90,11 @@ fun FaceSwapStudioScreen(
     val photoFlashActive by viewModel.photoFlashActive.collectAsStateWithLifecycle()
     val studioCaptures by viewModel.studioCaptures.collectAsStateWithLifecycle()
     val toastBanner by viewModel.toastBanner.collectAsStateWithLifecycle()
+
+    val scannedVideoSession by viewModel.scannedVideoSession.collectAsStateWithLifecycle()
+    val isScanningVideo by viewModel.isScanningVideo.collectAsStateWithLifecycle()
+    val isExportingVideo by viewModel.isExportingVideo.collectAsStateWithLifecycle()
+    val videoExportProgress by viewModel.videoExportProgress.collectAsStateWithLifecycle()
 
     val filteredCharacters = remember(allCharacters, selectedCategory) {
         if (selectedCategory == CharacterCategory.ALL) {
@@ -154,6 +160,15 @@ fun FaceSwapStudioScreen(
         }
     }
 
+    // Zero-permission Android Video Picker for pre-recorded multi-face video uploads
+    val videoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.handleUploadedVideoUri(uri)
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -203,6 +218,16 @@ fun FaceSwapStudioScreen(
                 photoPickerLauncher.launch(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                 )
+            },
+            onOpenVideoSwapStudio = {
+                if (scannedVideoSession != null) {
+                    viewModel.openSheet(ActiveModalSheet.VIDEO_SWAP_STUDIO)
+                } else {
+                    viewModel.openSheet(ActiveModalSheet.VIDEO_SWAP_STUDIO)
+                    videoPickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+                    )
+                }
             },
             onOpenManualRigEditor = viewModel::openManualSetupForCharacter,
             onCapturePhoto = {
@@ -259,7 +284,7 @@ fun FaceSwapStudioScreen(
             }
         }
 
-        // 6. Modal Bottom Sheets (Settings, Creator Guide, Studio Gallery)
+        // 6. Modal Bottom Sheets (Settings, Creator Guide, Studio Gallery, Video Swap Studio)
         if (activeSheet != ActiveModalSheet.NONE) {
             Box(
                 modifier = Modifier
@@ -301,6 +326,31 @@ fun FaceSwapStudioScreen(
                                 onDeleteCapture = viewModel::deleteCapture,
                                 onDeleteCustomCharacter = viewModel::deleteCustomCharacter,
                                 onEditCustomCharacter = viewModel::openManualSetupForCharacter,
+                                onClose = viewModel::closeSheet
+                            )
+                        }
+                        ActiveModalSheet.VIDEO_SWAP_STUDIO -> {
+                            VideoSwapStudioSheet(
+                                session = scannedVideoSession,
+                                isScanning = isScanningVideo,
+                                isExporting = isExportingVideo,
+                                exportProgress = videoExportProgress,
+                                allCharacters = allCharacters,
+                                blendOpacity = settings.blendOpacity,
+                                detailedMouthInterior = settings.detailedMouthInterior,
+                                processor = viewModel.videoMultiFaceProcessor,
+                                onPickAnotherVideo = {
+                                    videoPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+                                    )
+                                },
+                                onUploadCustomFaceImage = {
+                                    photoPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                },
+                                onAssignCharacterToSlot = viewModel::assignCharacterToVideoFaceSlot,
+                                onExportSwappedVideo = viewModel::exportMultiFaceSwappedVideo,
                                 onClose = viewModel::closeSheet
                             )
                         }

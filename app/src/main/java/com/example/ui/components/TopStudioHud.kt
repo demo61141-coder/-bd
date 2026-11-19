@@ -95,7 +95,13 @@ fun TopStudioHud(
                     modifier = Modifier
                         .size(9.dp)
                         .clip(CircleShape)
-                        .background(if (isRecording) CineRed else EmeraldReady)
+                        .background(
+                            when {
+                                isRecording -> CineRed
+                                livePose.isTracking -> EmeraldReady
+                                else -> com.example.ui.theme.AmberWarn
+                            }
+                        )
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
@@ -109,15 +115,22 @@ fun TopStudioHud(
                         color = TextAlabaster,
                         fontWeight = FontWeight.Bold
                     )
-                    val rigLabel = if (activeCharacter.rigType == RigType.AUTO_MESH) {
-                        "478 Mesh • ${livePose.fps} FPS"
+                    val statusText = if (livePose.isTracking) {
+                        val rigLabel = if (activeCharacter.rigType == RigType.AUTO_MESH) "478 Mesh" else "2D Puppet"
+                        "Tracking • ট্র্যাকিং ($rigLabel • ${livePose.fps} FPS)"
                     } else {
-                        "2D Puppet • ${livePose.fps} FPS"
+                        "মুখ খুঁজছে... • Point at Face (${livePose.fps} FPS)"
                     }
                     Text(
-                        text = "$rigLabel • Jaw ${(livePose.jawOpen * 100).toInt()}%",
+                        text = statusText,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (activeCharacter.rigType == RigType.AUTO_MESH) ElectricCyan else StudioViolet
+                        color = if (!livePose.isTracking) {
+                            com.example.ui.theme.AmberWarn
+                        } else if (activeCharacter.rigType == RigType.AUTO_MESH) {
+                            ElectricCyan
+                        } else {
+                            StudioViolet
+                        }
                     )
                 }
             }

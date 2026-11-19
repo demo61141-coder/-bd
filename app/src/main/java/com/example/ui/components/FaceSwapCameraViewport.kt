@@ -117,20 +117,27 @@ fun FaceSwapCameraViewport(
         )
     }
 
-    // Feed composite frames into MediaRecorder when video recording is active
-    LaunchedEffect(isRecording, livePose, activeCharacter.id, settings.blendOpacity, settings.detailedMouthInterior) {
-        if (isRecording) {
+    // Feed composite frames into MediaRecorder at a steady 30fps when video recording is active
+    val currentPoseState = androidx.compose.runtime.rememberUpdatedState(livePose)
+    val currentCharState = androidx.compose.runtime.rememberUpdatedState(activeCharacter)
+    val currentCharBmpState = androidx.compose.runtime.rememberUpdatedState(characterBitmap)
+    val currentSettingsState = androidx.compose.runtime.rememberUpdatedState(settings)
+
+    LaunchedEffect(isRecording) {
+        while (isRecording) {
             val previewBmp = runCatching { previewViewRef?.bitmap }.getOrNull()
+            val s = currentSettingsState.value
             mediaRecorder.recordCompositeFrame(
                 cameraPreviewBitmap = previewBmp,
-                character = activeCharacter,
-                characterBitmap = characterBitmap,
-                pose = livePose,
-                blendOpacity = settings.blendOpacity,
-                detailedMouthInterior = settings.detailedMouthInterior,
-                showMeshWireframe = settings.showMeshWireframe,
-                isMirrored = settings.isMirrored
+                character = currentCharState.value,
+                characterBitmap = currentCharBmpState.value,
+                pose = currentPoseState.value,
+                blendOpacity = s.blendOpacity,
+                detailedMouthInterior = s.detailedMouthInterior,
+                showMeshWireframe = s.showMeshWireframe,
+                isMirrored = s.isMirrored
             )
+            kotlinx.coroutines.delay(33L)
         }
     }
 
@@ -145,7 +152,7 @@ fun FaceSwapCameraViewport(
                 factory = { ctx ->
                     PreviewView(ctx).apply {
                         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                        scaleType = PreviewView.ScaleType.FIT_CENTER
                         previewViewRef = this
                         onPreviewViewReady(this)
                     }
@@ -176,6 +183,9 @@ fun FaceSwapCameraViewport(
                 .fillMaxSize()
                 .testTag("warped_face_canvas")
         ) {
+            if (size.height > 1f) {
+                faceTrackerEngine.viewportAspectRatio = size.width / size.height
+            }
             FaceSwapRenderer.renderWarpedCharacter(
                 canvas = drawContext.canvas.nativeCanvas,
                 viewportWidth = size.width,
@@ -187,6 +197,35 @@ fun FaceSwapCameraViewport(
                 detailedMouthInterior = settings.detailedMouthInterior,
                 showMeshWireframe = settings.showMeshWireframe
             )
+        }
+
+        // Low-light / No-face-yet Guidance Pill when Camera is active but no face is currently locked
+        if (hasCameraPermission && !isModelLoading && !livePose.isTracking && !settings.useDemoMotionFeed) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 104.dp, start = 20.dp, end = 20.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(StudioSurfaceGlass)
+                    .border(1.dp, com.example.ui.theme.AmberWarn, RoundedCornerShape(18.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "মুখ শনাক্ত হচ্ছে না — ক্যামেরার দিকে সোজা তাকান ও মুখে পর্যাপ্ত আলো রাখুন",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = TextAlabaster,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "Face not detected yet — face the camera in clear front lighting",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.example.ui.theme.AmberWarn,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
         }
 
         // Loading HUD Card while Face Landmarker initializes
@@ -341,12 +380,14 @@ private fun bindCameraUseCases(
             }
 
             cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
+            val camera = cameraProvider.bindToLifecycle(
                 lifecycleOwner,
                 selector,
                 preview,
                 imageAnalysis
             )
+            // Enforce 0% digital zoom (widest natural camera FOV like the phone's default camera app)
+            camera.cameraControl.setLinearZoom(0f)
         }
     }, ContextCompat.getMainExecutor(context))
 }

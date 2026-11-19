@@ -19,10 +19,15 @@ import {
   saveCustomCharacterToDB
 } from './utils/db';
 import { OneEuroLandmarkBank } from './utils/oneEuroFilter';
-import { renderCompositeCanvasFrame } from './utils/webglRenderer';
+import {
+  computeVideoDrawRect,
+  createFaceCutoutFromLandmarks,
+  renderCompositeCanvasFrame
+} from './utils/webglRenderer';
 import { ManualSetupModal } from './components/ManualSetupModal';
 import { SettingsModal } from './components/SettingsModal';
 import { GuideModal } from './components/GuideModal';
+import { VideoSwapModal } from './components/VideoSwapModal';
 
 // Indices mapping MediaPipe 478 Face Landmarker points to our 36 canonical triangulation points
 const MP_TO_36_INDICES = [
@@ -55,14 +60,20 @@ export const App: React.FC = () => {
   });
 
   const [isLoadingModel, setIsLoadingModel] = useState(true);
+  const [isLiveFaceDetected, setIsLiveFaceDetected] = useState(false);
   const [permissionError, setPermissionError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [manualUploadDataUrl, setManualUploadDataUrl] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
+  const [showVideoSwap, setShowVideoSwap] = useState(false);
 
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
+  const isStaticDetectingRef = useRef<boolean>(false);
+  const lastDetectTimestampRef = useRef<number>(0);
+  const lastTrackedPtsRef = useRef<Point2D[]>(CANONICAL_36_POINTS);
+  const lastTrackedTimeRef = useRef<number>(0);
   const filterBankRef = useRef(new OneEuroLandmarkBank());
   const activeCharImgRef = useRef<HTMLImageElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -70,7 +81,7 @@ export const App: React.FC = () => {
 
   const showToastMsg = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(null), 3200);
+    setTimeout(() => setToast(null), 3500);
   };
 
   // Load saved custom characters from IndexedDB
@@ -86,13 +97,13 @@ export const App: React.FC = () => {
   useEffect(() => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.src = selectedChar.imageDataUrl;
     img.onload = () => {
       activeCharImgRef.current = img;
     };
+    img.src = selectedChar.imageDataUrl;
   }, [selectedChar]);
 
-  // Initialize MediaPipe Face Landmarker (GPU)
+  // Initialize MediaPipe Face Landmarker (GPU with CPU fallback)
   useEffect(() => {
     let cancelled = false;
     async function initMediaPipe() {
@@ -100,16 +111,36 @@ export const App: React.FC = () => {
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
         );
-        const landmarker = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-            delegate: 'GPU'
-          },
-          outputFaceBlendshapes: true,
-          runningMode: 'VIDEO',
-          numFaces: 1
-        });
+        let landmarker: FaceLandmarker;
+        try {
+          landmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+              delegate: 'GPU'
+            },
+            outputFaceBlendshapes: true,
+            runningMode: 'VIDEO',
+            numFaces: 1,
+            minFaceDetectionConfidence: 0.35,
+            minFacePresenceConfidence: 0.35,
+            minTrackingConfidence: 0.35
+          });
+        } catch {
+          landmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+              delegate: 'CPU'
+            },
+            outputFaceBlendshapes: true,
+            runningMode: 'VIDEO',
+            numFaces: 1,
+            minFaceDetectionConfidence: 0.35,
+            minFacePresenceConfidence: 0.35,
+            minTrackingConfidence: 0.35
+          });
+        }
         if (!cancelled) {
           landmarkerRef.current = landmarker;
           setIsLoadingModel(false);
@@ -126,18 +157,45 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Open camera via getUserMedia
+  // Open camera via getUserMedia at natural un-zoomed field of view
   useEffect(() => {
     let activeStream: MediaStream | null = null;
     async function startCamera() {
       try {
         setPermissionError(null);
-        const targetW = settings.resolution === '1080p' ? 1080 : 720;
-        const targetH = settings.resolution === '1080p' ? 1920 : 1280;
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: settings.facingMode, width: { ideal: targetW }, height: { ideal: targetH } },
-          audio: true
-        });
+        let stream: MediaStream;
+        try {
+          // Request natural 4:3 sensor aspect ratio so the camera is not digitally cropped/zoomed
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: settings.facingMode,
+              width: { ideal: 1280 },
+              height: { ideal: 960 }
+            },
+            audio: true
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: settings.facingMode },
+            audio: false
+          });
+        }
+
+        // Explicitly reset hardware/digital zoom to minimum (1.0x) if supported by the phone lens
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoTrack && typeof videoTrack.getCapabilities === 'function') {
+          try {
+            const caps = videoTrack.getCapabilities() as Record<string, { min?: number }>;
+            if (caps.zoom && typeof caps.zoom.min === 'number') {
+              await videoTrack.applyConstraints({
+                advanced: [{ zoom: caps.zoom.min } as MediaTrackConstraintSet]
+              });
+            }
+          } catch {
+            // Ignore if zoom constraint is unsupported
+          }
+        }
+
         activeStream = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -160,46 +218,95 @@ export const App: React.FC = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
       if (canvas) {
+        // Match canvas internal resolution to its exact screen display aspect ratio (prevents CSS double-zoom!)
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const targetW = Math.round((canvas.clientWidth || window.innerWidth) * dpr);
+        const targetH = Math.round((canvas.clientHeight || window.innerHeight) * dpr);
+        if (targetW > 0 && targetH > 0 && (canvas.width !== targetW || canvas.height !== targetH)) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          const nowMs = performance.now();
+          const nowMs = Math.max(performance.now(), lastDetectTimestampRef.current + 1);
+          lastDetectTimestampRef.current = nowMs;
           const tSec = nowMs / 1000;
-          let pts36: Point2D[] = CANONICAL_36_POINTS;
+
+          let pts36: Point2D[] = lastTrackedPtsRef.current;
+          let faceDetectedNow = false;
           let blendshapes: LiveBlendshapes = {
-            jawOpen: 0.08 + Math.max(0, Math.sin(tSec * 3.2) * 0.35),
+            jawOpen: 0.05,
             eyeBlinkLeft: 0,
             eyeBlinkRight: 0,
-            yaw: Math.sin(tSec * 0.8) * 8,
-            pitch: Math.cos(tSec * 0.6) * 5,
-            roll: Math.sin(tSec * 0.5) * 4
+            yaw: 0,
+            pitch: 0,
+            roll: 0
           };
 
-          if (landmarkerRef.current && video && video.readyState >= 2) {
+          if (
+            landmarkerRef.current &&
+            !isStaticDetectingRef.current &&
+            video &&
+            video.readyState >= 2 &&
+            video.videoWidth > 0
+          ) {
             try {
               const res = landmarkerRef.current.detectForVideo(video, nowMs);
               if (res.faceLandmarks && res.faceLandmarks.length > 0) {
+                faceDetectedNow = true;
+                lastTrackedTimeRef.current = nowMs;
                 const lm478 = res.faceLandmarks[0];
+
+                const vw = video.videoWidth;
+                const vh = video.videoHeight;
+                const cw = canvas.width;
+                const ch = canvas.height;
+                const { drawX, drawY, drawW, drawH } = computeVideoDrawRect(cw, ch, vw, vh);
+
                 pts36 = MP_TO_36_INDICES.map((mpIdx, i) => {
                   const pt = lm478[mpIdx] || { x: 0.5, y: 0.5 };
                   const rawX = settings.isMirrored ? 1 - pt.x : pt.x;
-                  return filterBankRef.current.filterPoint(i, rawX, pt.y, settings.smoothingStrength, tSec);
+                  const canvasNormX = (rawX * drawW + drawX) / cw;
+                  const canvasNormY = (pt.y * drawH + drawY) / ch;
+                  return filterBankRef.current.filterPoint(
+                    i,
+                    canvasNormX,
+                    canvasNormY,
+                    settings.smoothingStrength,
+                    tSec
+                  );
                 });
+                lastTrackedPtsRef.current = pts36;
 
                 const cats = res.faceBlendshapes?.[0]?.categories || [];
                 const findScore = (name: string) => cats.find((c) => c.categoryName === name)?.score || 0;
+
+                const le = pts36[9];
+                const re = pts36[15];
+                const nose = pts36[18];
+                const eyeMidX = (le.x + re.x) * 0.5;
+                const eyeDist = Math.max(0.05, Math.hypot(re.x - le.x, re.y - le.y));
+                const rollDeg = (Math.atan2(re.y - le.y, re.x - le.x) * 180) / Math.PI;
+                const yawDeg = ((nose.x - eyeMidX) / eyeDist) * 45;
+
                 blendshapes = {
                   jawOpen: filterBankRef.current.filterScalar('jaw', findScore('jawOpen'), settings.smoothingStrength, tSec),
                   eyeBlinkLeft: filterBankRef.current.filterScalar('blL', findScore('eyeBlinkLeft'), settings.smoothingStrength, tSec),
                   eyeBlinkRight: filterBankRef.current.filterScalar('blR', findScore('eyeBlinkRight'), settings.smoothingStrength, tSec),
-                  yaw: 0,
+                  yaw: filterBankRef.current.filterScalar('yaw', yawDeg, settings.smoothingStrength, tSec),
                   pitch: 0,
-                  roll: 0
+                  roll: filterBankRef.current.filterScalar('roll', rollDeg, settings.smoothingStrength, tSec)
                 };
+              } else if (nowMs - lastTrackedTimeRef.current < 450) {
+                faceDetectedNow = true;
               }
             } catch {
-              // Fallback to synthesized smooth motion
+              // Keep last state
             }
           }
+
+          setIsLiveFaceDetected(faceDetectedNow);
 
           renderCompositeCanvasFrame(
             ctx,
@@ -208,6 +315,7 @@ export const App: React.FC = () => {
             video,
             activeCharImgRef.current,
             selectedChar,
+            faceDetectedNow,
             pts36,
             blendshapes,
             settings.blendOpacity,
@@ -223,15 +331,61 @@ export const App: React.FC = () => {
     return () => cancelAnimationFrame(animId);
   }, [selectedChar, settings]);
 
-  // Handle Custom Image Upload
+  // Handle Custom Image Upload: First try MediaPipe face detection; if it fails, open Manual Setup!
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
+
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = reader.result as string;
-      // Open Manual Setup Editor so user can configure or confirm 5 points & boxes for human/cartoon/animal
-      setManualUploadDataUrl(dataUrl);
+      const img = new Image();
+      img.onload = async () => {
+        const landmarker = landmarkerRef.current;
+        if (landmarker) {
+          try {
+            isStaticDetectingRef.current = true;
+            await landmarker.setOptions({ runningMode: 'IMAGE' });
+            const detection = landmarker.detect(img);
+            await landmarker.setOptions({ runningMode: 'VIDEO' });
+            isStaticDetectingRef.current = false;
+
+            if (detection.faceLandmarks && detection.faceLandmarks.length > 0) {
+              const lm478 = detection.faceLandmarks[0];
+              const cutout = createFaceCutoutFromLandmarks(img, lm478, MP_TO_36_INDICES);
+              const customCount = characters.filter((c) => c.isCustom).length + 1;
+              const newChar: CharacterItem = {
+                id: `custom_${Date.now()}`,
+                nameEn: `Custom Face #${customCount}`,
+                nameBn: `কাস্টম মুখ #${customCount}`,
+                category: 'CUSTOM',
+                rigType: 'AUTO_MESH',
+                imageDataUrl: cutout.dataUrl,
+                landmarks: cutout.landmarks36,
+                puppetConfig: DEFAULT_PUPPET_CONFIG,
+                isCustom: true
+              };
+              await saveCustomCharacterToDB(newChar);
+              setCharacters((prev) => [newChar, ...prev]);
+              setSelectedChar(newChar);
+              showToastMsg('মানুষের মুখ শনাক্ত হয়েছে! ৪৭৮ মেস রেডি / Face detected & background cutout ready!');
+              return;
+            }
+          } catch {
+            isStaticDetectingRef.current = false;
+            try {
+              await landmarker.setOptions({ runningMode: 'VIDEO' });
+            } catch {
+              // ignore
+            }
+          }
+        }
+        // No human face detected -> open Manual Setup Editor for Cartoon / Animal
+        showToastMsg('মানুষের মুখ পাওয়া যায়নি — কার্টুন/প্রাণীর জন্য ম্যানুয়াল সেটআপ খুলছে');
+        setManualUploadDataUrl(dataUrl);
+      };
+      img.src = dataUrl;
     };
     reader.readAsDataURL(file);
   };
@@ -336,7 +490,22 @@ export const App: React.FC = () => {
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', background: '#090A0F', overflow: 'hidden' }}>
-      <video ref={videoRef} playsInline muted style={{ display: 'none' }} />
+      {/* Do NOT use display:none on video in Android WebView or frame decoding pauses */}
+      <video
+        ref={videoRef}
+        playsInline
+        muted
+        autoPlay
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: 2,
+          height: 2,
+          opacity: 0.001,
+          pointerEvents: 'none'
+        }}
+      />
       <canvas
         ref={canvasRef}
         width={settings.resolution === '1080p' ? 1080 : 720}
@@ -347,9 +516,10 @@ export const App: React.FC = () => {
       <input
         ref={fileInputRef}
         type="file"
+        hidden
         accept="image/png,image/jpeg,image/webp"
         onChange={handleFileUpload}
-        style={{ display: 'none' }}
+        style={{ position: 'absolute', width: 0, height: 0, opacity: 0, pointerEvents: 'none' }}
       />
 
       {/* Top HUD */}
@@ -358,12 +528,27 @@ export const App: React.FC = () => {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center'
       }}>
         <div style={{
-          background: 'rgba(20,23,34,0.82)', padding: '8px 14px', borderRadius: 20,
-          border: '1px solid #2A314A', fontSize: 13, fontWeight: 700
+          background: 'rgba(20,23,34,0.85)', padding: '8px 14px', borderRadius: 20,
+          border: '1px solid #2A314A', fontSize: 13
         }}>
-          FaceSwap Cam • ফেসসোয়াপ ক্যাম
+          <div style={{ fontWeight: 700 }}>FaceSwap Cam • ফেসসোয়াপ ক্যাম</div>
+          <div style={{ fontSize: 11, color: isLiveFaceDetected ? '#10B981' : '#F59E0B', marginTop: 2 }}>
+            {isLiveFaceDetected ? '● Tracking • ট্র্যাকিং' : '● মুখ খুঁজছে... • Point at Face'}
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={() =>
+              setSettings((prev) => ({
+                ...prev,
+                facingMode: prev.facingMode === 'user' ? 'environment' : 'user',
+                isMirrored: prev.facingMode !== 'user'
+              }))
+            }
+            style={{ background: 'rgba(20,23,34,0.85)', color: '#F8FAFC', border: '1px solid #2A314A', padding: '8px 12px', borderRadius: 16 }}
+          >
+            Flip
+          </button>
           <button
             onClick={() => setShowGuide(true)}
             style={{ background: 'rgba(20,23,34,0.85)', color: '#F8FAFC', border: '1px solid #2A314A', padding: '8px 12px', borderRadius: 16 }}
@@ -401,9 +586,9 @@ export const App: React.FC = () => {
 
       {toast && (
         <div style={{
-          position: 'absolute', top: 68, left: '50%', transform: 'translateX(-50%)',
+          position: 'absolute', top: 76, left: '50%', transform: 'translateX(-50%)',
           background: 'rgba(20,23,34,0.95)', padding: '8px 16px', borderRadius: 14, border: '1px solid #00E5FF',
-          fontSize: 12
+          fontSize: 12, textAlign: 'center', maxWidth: '88vw'
         }}>
           {toast}
         </div>
@@ -442,11 +627,20 @@ export const App: React.FC = () => {
           <button
             onClick={() => fileInputRef.current?.click()}
             style={{
-              minWidth: 70, padding: 8, borderRadius: 14, border: '1.5px solid #00E5FF',
+              minWidth: 72, padding: 8, borderRadius: 14, border: '1.5px dashed #00E5FF',
               background: '#1B2032', color: '#00E5FF', fontSize: 11, fontWeight: 700, cursor: 'pointer'
             }}
           >
-            + আপলোড<br />Upload
+            + ছবি মুখ<br />Upload Face
+          </button>
+          <button
+            onClick={() => setShowVideoSwap(true)}
+            style={{
+              minWidth: 76, padding: 8, borderRadius: 14, border: '1.5px solid #A855F7',
+              background: '#1B2032', color: '#F8FAFC', fontSize: 11, fontWeight: 700, cursor: 'pointer'
+            }}
+          >
+            🎬 ভিডিও সোয়াপ<br />Video Swap
           </button>
           {filteredChars.map((c) => (
             <button
@@ -490,13 +684,13 @@ export const App: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setManualUploadDataUrl(selectedChar.imageDataUrl)}
+            onClick={() => setShowVideoSwap(true)}
             style={{
               padding: '10px 14px', borderRadius: 20, border: '1.5px solid #A855F7',
               background: '#1B2032', color: '#F8FAFC', fontWeight: 700, fontSize: 11, cursor: 'pointer'
             }}
           >
-            রিগ / Edit Rig
+            ভিডিও সোয়াপ / Video Swap
           </button>
         </div>
       </div>
@@ -519,6 +713,19 @@ export const App: React.FC = () => {
       )}
 
       {showGuide && <GuideModal onClose={() => setShowGuide(false)} />}
+
+      {showVideoSwap && (
+        <VideoSwapModal
+          characters={characters}
+          defaultCharacterId={selectedChar.id}
+          settings={settings}
+          landmarker={landmarkerRef.current}
+          mpTo36Indices={MP_TO_36_INDICES}
+          onUploadCustomFace={() => fileInputRef.current?.click()}
+          onShowToast={showToastMsg}
+          onClose={() => setShowVideoSwap(false)}
+        />
+      )}
     </div>
   );
 };

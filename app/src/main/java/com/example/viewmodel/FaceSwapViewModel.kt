@@ -23,6 +23,8 @@ import com.example.recording.StudioMediaRecorder
 import com.example.tracking.FaceTrackerEngine
 import com.example.tracking.OneEuroFilterBank
 import com.example.tracking.StaticFaceDetectionResult
+import com.example.video.ScannedVideoSession
+import com.example.video.VideoMultiFaceProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,7 +42,8 @@ enum class ActiveModalSheet {
     NONE,
     SETTINGS,
     GUIDE,
-    STUDIO_GALLERY
+    STUDIO_GALLERY,
+    VIDEO_SWAP_STUDIO
 }
 
 data class ManualSetupDraft(
@@ -59,6 +62,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
     private val repository = StudioRepository(application, database.studioDao())
     private val filterBank = OneEuroFilterBank()
     val mediaRecorder = StudioMediaRecorder(application)
+    val videoMultiFaceProcessor = VideoMultiFaceProcessor(application)
 
     val settings: StateFlow<StudioSettings> = repository.settingsFlow.stateIn(
         scope = viewModelScope,
@@ -118,6 +122,19 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     private val _toastBanner = MutableStateFlow<String?>(null)
     val toastBanner: StateFlow<String?> = _toastBanner.asStateFlow()
+
+    // Multi-Face Pre-Recorded Video Upload Studio State
+    private val _scannedVideoSession = MutableStateFlow<ScannedVideoSession?>(null)
+    val scannedVideoSession: StateFlow<ScannedVideoSession?> = _scannedVideoSession.asStateFlow()
+
+    private val _isScanningVideo = MutableStateFlow(false)
+    val isScanningVideo: StateFlow<Boolean> = _isScanningVideo.asStateFlow()
+
+    private val _isExportingVideo = MutableStateFlow(false)
+    val isExportingVideo: StateFlow<Boolean> = _isExportingVideo.asStateFlow()
+
+    private val _videoExportProgress = MutableStateFlow(0f)
+    val videoExportProgress: StateFlow<Float> = _videoExportProgress.asStateFlow()
 
     private var recordingTimerJob: Job? = null
 
@@ -314,14 +331,14 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     val saved = repository.saveCustomCharacter(
                         id = newId,
                         nameEn = "Custom Face #$customIndex",
-                        nameBn = "নিজস্ব ফেস #$customIndex",
+                        nameBn = "কাস্টম মুখ #$customIndex",
                         rigType = RigType.AUTO_MESH,
-                        bitmap = scaled,
+                        bitmap = detection.croppedFaceBitmap,
                         puppetConfig = detection.puppetConfig,
                         meshControlPoints = detection.controlPoints
                     )
                     _selectedCharacterId.value = saved.id
-                    showToast("মানুষের মুখ শনাক্ত হয়েছে! ৪৭৮-মেস রেডি / Face landmarks detected & saved!")
+                    showToast("মানুষের মুখ ও ল্যান্ডমার্ক শনাক্ত হয়েছে! / Face cutout & 478-Mesh ready!")
                 }
                 is StaticFaceDetectionResult.NoHumanFaceFound -> {
                     // Automatically open Manual Setup Editor for Cartoon / Animal / Stylized character
@@ -497,6 +514,73 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             repository.deleteStudioCapture(item)
             showToast("ফাইল মুছে ফেলা হয়েছে / Capture deleted")
+        }
+    }
+
+    // ==================== PRE-RECORDED VIDEO UPLOAD & MULTI-FACE SWAP STUDIO ====================
+
+    fun handleUploadedVideoUri(uri: Uri) {
+        _activeSheet.value = ActiveModalSheet.VIDEO_SWAP_STUDIO
+        _isScanningVideo.value = true
+        viewModelScope.launch {
+            val session = videoMultiFaceProcessor.scanUploadedVideo(
+                videoUri = uri,
+                defaultCharacterId = _selectedCharacterId.value
+            )
+            _isScanningVideo.value = false
+            if (session != null) {
+                _scannedVideoSession.value = session
+                val count = session.detectedSlots.size
+                showToast("ভিডিওতে ${count}টি মুখ পাওয়া গেছে! / Found $count faces in video!")
+            } else {
+                showToast("ভিডিও লোড করা যায়নি / Could not process video")
+            }
+        }
+    }
+
+    fun assignCharacterToVideoFaceSlot(slotIndex: Int, characterId: String?) {
+        val current = _scannedVideoSession.value ?: return
+        val updatedSlots = current.detectedSlots.map { slot ->
+            if (slot.slotIndex == slotIndex) {
+                slot.copy(assignedCharacterId = characterId)
+            } else {
+                slot
+            }
+        }
+        _scannedVideoSession.value = current.copy(detectedSlots = updatedSlots)
+    }
+
+    fun exportMultiFaceSwappedVideo() {
+        val session = _scannedVideoSession.value ?: return
+        if (_isExportingVideo.value) return
+
+        _isExportingVideo.value = true
+        _videoExportProgress.value = 0f
+        viewModelScope.launch {
+            val currentSettings = settings.value
+            val exportedFile = videoMultiFaceProcessor.exportMultiFaceSwappedVideo(
+                session = session,
+                slots = session.detectedSlots,
+                allCharacters = allCharacters.value,
+                resolution = currentSettings.resolution,
+                blendOpacity = currentSettings.blendOpacity,
+                detailedMouthInterior = currentSettings.detailedMouthInterior,
+                onProgress = { progress ->
+                    _videoExportProgress.value = progress
+                }
+            )
+            _isExportingVideo.value = false
+            if (exportedFile != null) {
+                val activeCount = session.detectedSlots.count { it.assignedCharacterId != null }
+                repository.saveRecordedVideo(
+                    videoFile = exportedFile,
+                    characterName = "Multi-Face Video ($activeCount faces)",
+                    durationMs = session.durationMs
+                )
+                showToast("মাল্টি-ফেস ভিডিও গ্যালারি ও স্টুডিওতে সেভ হয়েছে! / Multi-face video saved to Gallery!")
+            } else {
+                showToast("ভিডিও এক্সপোর্ট করা যায়নি / Failed to export video")
+            }
         }
     }
 

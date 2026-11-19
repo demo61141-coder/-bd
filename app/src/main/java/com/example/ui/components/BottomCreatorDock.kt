@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -78,6 +79,7 @@ fun BottomCreatorDock(
     onSelectCategory: (CharacterCategory) -> Unit,
     onSelectCharacter: (CharacterItem) -> Unit,
     onUploadFromGallery: () -> Unit,
+    onOpenVideoSwapStudio: () -> Unit,
     onOpenManualRigEditor: (CharacterItem) -> Unit,
     onCapturePhoto: () -> Unit,
     onToggleRecordVideo: () -> Unit,
@@ -96,7 +98,7 @@ fun BottomCreatorDock(
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(top = 10.dp, bottom = 12.dp)
     ) {
-        // 1. Category Filter Chips + Manual Rig Fine-Tune Button
+        // 1. Category Filter Chips + Video Swap Button + Manual Rig Fine-Tune Button
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -107,7 +109,7 @@ fun BottomCreatorDock(
             LazyRow(
                 modifier = Modifier.weight(1f),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
-                contentPadding = PaddingValues(end = 8.dp)
+                contentPadding = PaddingValues(end = 6.dp)
             ) {
                 items(categories) { category ->
                     val isSelected = category == selectedCategory
@@ -139,6 +141,38 @@ fun BottomCreatorDock(
                 }
             }
 
+            // Pre-Recorded Multi-Face Video Upload & Swap Button
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(ElectricCyan.copy(alpha = 0.18f))
+                    .border(1.dp, ElectricCyan, RoundedCornerShape(16.dp))
+                    .clickable(onClick = onOpenVideoSwapStudio)
+                    .padding(horizontal = 9.dp, vertical = 6.dp)
+                    .testTag("video_swap_studio_button"),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.VideoFile,
+                    contentDescription = "Video Multi-Face Swap / ভিডিও সোয়াপ",
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(3.dp))
+                Text(
+                    text = when (languageMode) {
+                        LanguageMode.BILINGUAL -> "ভিডিও সোয়াপ"
+                        LanguageMode.BENGALI -> "ভিডিও সোয়াপ"
+                        LanguageMode.ENGLISH -> "Video Swap"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.width(5.dp))
+
             // Edit 5-Point Rig Button for active character
             Row(
                 modifier = Modifier
@@ -146,7 +180,7 @@ fun BottomCreatorDock(
                     .background(StudioViolet.copy(alpha = 0.22f))
                     .border(1.dp, StudioViolet, RoundedCornerShape(16.dp))
                     .clickable { onOpenManualRigEditor(selectedCharacter) }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .padding(horizontal = 9.dp, vertical = 6.dp)
                     .testTag("edit_rig_button"),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -156,10 +190,10 @@ fun BottomCreatorDock(
                     tint = TextAlabaster,
                     modifier = Modifier.size(14.dp)
                 )
-                Spacer(modifier = Modifier.width(4.dp))
+                Spacer(modifier = Modifier.width(3.dp))
                 Text(
                     text = when (languageMode) {
-                        LanguageMode.BILINGUAL -> "রিগ এডিট / Rig"
+                        LanguageMode.BILINGUAL -> "রিগ / Rig"
                         LanguageMode.BENGALI -> "পাপেট রিগ"
                         LanguageMode.ENGLISH -> "Edit Rig"
                     },
@@ -172,7 +206,7 @@ fun BottomCreatorDock(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // 2. Character Carousel (+ Upload Button + Demo & Custom Characters)
+        // 2. Character Carousel (+ Upload Face Button + Upload Video Button + Demo & Custom Characters)
         LazyRow(
             modifier = Modifier
                 .fillMaxWidth()
@@ -185,6 +219,13 @@ fun BottomCreatorDock(
                 UploadCharacterCard(
                     languageMode = languageMode,
                     onClick = onUploadFromGallery
+                )
+            }
+
+            item(key = "upload_video_swap_item") {
+                UploadVideoSwapCard(
+                    languageMode = languageMode,
+                    onClick = onOpenVideoSwapStudio
                 )
             }
 
@@ -386,12 +427,58 @@ private fun UploadCharacterCard(
         Spacer(modifier = Modifier.height(6.dp))
         Text(
             text = when (languageMode) {
-                LanguageMode.BILINGUAL -> "+ আপলোড\nUpload"
-                LanguageMode.BENGALI -> "+ আপলোড\nগ্যালারি"
-                LanguageMode.ENGLISH -> "+ Upload\nGallery"
+                LanguageMode.BILINGUAL -> "+ ছবি মুখ\nUpload Face"
+                LanguageMode.BENGALI -> "+ ছবি মুখ\nগ্যালারি"
+                LanguageMode.ENGLISH -> "+ Upload\nFace"
             },
             style = MaterialTheme.typography.labelSmall,
             color = ElectricCyan,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+            lineHeight = 12.sp
+        )
+    }
+}
+
+@Composable
+private fun UploadVideoSwapCard(
+    languageMode: LanguageMode,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(78.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(StudioCard)
+            .border(1.5.dp, StudioViolet, RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 4.dp)
+            .testTag("carousel_video_swap_button"),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .size(50.dp)
+                .clip(CircleShape)
+                .background(StudioViolet.copy(alpha = 0.22f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.VideoFile,
+                contentDescription = "Upload Pre-Recorded Video / ভিডিও সোয়াপ",
+                tint = TextAlabaster,
+                modifier = Modifier.size(26.dp)
+            )
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = when (languageMode) {
+                LanguageMode.BILINGUAL -> "ভিডিও সোয়াপ\nVideo Swap"
+                LanguageMode.BENGALI -> "ভিডিও আপলোড\nসব মুখ চেঞ্জ"
+                LanguageMode.ENGLISH -> "Video Swap\nMulti-Face"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = TextAlabaster,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center,
             lineHeight = 12.sp
