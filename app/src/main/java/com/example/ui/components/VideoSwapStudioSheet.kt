@@ -138,8 +138,14 @@ fun VideoSwapStudioSheet(
     ) {
         val s = session ?: return@LaunchedEffect
         if (s.sampleFrames.isEmpty()) return@LaunchedEffect
-        val rawFrame = s.sampleFrames[currentFrameIndex.coerceIn(0, s.sampleFrames.lastIndex)]
-        val matched: List<MatchedFrameFace> = processor.matchFacesInFrame(rawFrame, s.detectedSlots)
+        val clampedIdx = currentFrameIndex.coerceIn(0, s.sampleFrames.lastIndex)
+        val rawFrame = s.sampleFrames[clampedIdx]
+        val matched: List<MatchedFrameFace> = processor.matchFacesInFrame(
+            frame = rawFrame,
+            slots = s.detectedSlots,
+            frameIndex = clampedIdx,
+            session = s
+        )
         compositedPreviewBitmap = processor.renderMultiFaceFrame(
             sourceFrame = rawFrame,
             matchedFaces = matched,

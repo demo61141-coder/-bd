@@ -103,6 +103,161 @@ export function createFaceCutoutFromLandmarks(
 }
 
 /**
+ * 3D cylindrical head-model projection of the 36 canonical facial vertices for wide head turns
+ * (yaw up to ±75°, pitch up to ±45°, roll ±60°).
+ * Foreshortens the far side of the face realistically when turning left or right so the swapped
+ * face stays locked onto the person's head during side-profile talking!
+ */
+export function projectCanonical36ToBox(
+  centerX: number,
+  centerY: number,
+  boxWidth: number,
+  boxHeight: number,
+  yawDeg: number,
+  pitchDeg: number,
+  rollDeg: number,
+  jawOpen: number,
+  blinkLeft: number,
+  blinkRight: number
+): Point2D[] {
+  const rollRad = (rollDeg * Math.PI) / 180;
+  const cosR = Math.cos(rollRad);
+  const sinR = Math.sin(rollRad);
+
+  const yawClamped = Math.max(-75, Math.min(75, yawDeg));
+  const yawRad = (yawClamped * Math.PI) / 180;
+  const sinYaw = Math.sin(yawRad);
+  const cosYaw = Math.max(0.28, Math.cos(yawRad));
+  const pitchShift = Math.max(-0.45, Math.min(0.45, pitchDeg / 45));
+
+  return CANONICAL_36_POINTS.map((pt, idx) => {
+    const lx = pt.x - 0.5;
+    let ly = pt.y - 0.5;
+
+    if (idx === 10) ly += blinkLeft * 0.026;
+    if (idx === 12) ly -= blinkLeft * 0.020;
+    if (idx === 14) ly += blinkRight * 0.026;
+    if (idx === 16) ly -= blinkRight * 0.020;
+
+    if (idx === 29) ly -= jawOpen * 0.008;
+    if (idx === 30) ly += jawOpen * 0.068;
+    if (idx === 28) ly += jawOpen * 0.072;
+    if (idx === 32 || idx === 34) ly += jawOpen * 0.048;
+    if (idx === 33) ly += jawOpen * 0.058;
+
+    const normHoriz = Math.max(-1, Math.min(1, lx / 0.34));
+    const zDepth = Math.max(0.2, 1 - normHoriz * normHoriz * 0.65);
+
+    const sideCompression =
+      lx * sinYaw < 0
+        ? cosYaw * 0.72 // Far side of face turned away from camera compresses
+        : 0.65 + 0.35 * cosYaw; // Near side stays prominent
+
+    const rotated3DX = lx * sideCompression + zDepth * sinYaw * 0.16;
+    const rotated3DY = ly + pitchShift * 0.12 * zDepth;
+
+    const scaledX = rotated3DX * (boxWidth / 0.64);
+    const scaledY = rotated3DY * (boxHeight / 0.70);
+
+    const rx = scaledX * cosR - scaledY * sinR;
+    const ry = scaledX * sinR + scaledY * cosR;
+
+    return {
+      x: Math.max(-0.15, Math.min(1.15, centerX + rx)),
+      y: Math.max(-0.15, Math.min(1.15, centerY + ry))
+    };
+  });
+}
+
+/**
+ * Tracks a person's head position, scale, and left/right profile yaw direction directly from
+ * skin-tone vs hair pixel distribution when they turn their head sideways (>45°..85° profile)
+ * and MediaPipe's frontal detector temporarily drops out.
+ */
+export function estimateProfileHeadInCanvas(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  prevX: number,
+  prevY: number,
+  prevScale: number,
+  prevYaw: number
+): { centerX: number; centerY: number; scale: number; yaw: number } {
+  try {
+    const searchRadius = Math.max(0.20, Math.min(0.50, prevScale * 1.1));
+    const minPxX = Math.max(0, Math.floor((prevX - searchRadius) * width));
+    const maxPxX = Math.min(width - 1, Math.ceil((prevX + searchRadius) * width));
+    const minPxY = Math.max(0, Math.floor((prevY - searchRadius) * height));
+    const maxPxY = Math.min(height - 1, Math.ceil((prevY + searchRadius) * height));
+    const boxW = Math.max(16, maxPxX - minPxX);
+    const boxH = Math.max(16, maxPxY - minPxY);
+
+    const imgData = ctx.getImageData(minPxX, minPxY, boxW, boxH).data;
+    let skinSumX = 0;
+    let skinSumY = 0;
+    let skinWeight = 0;
+    let hairSumX = 0;
+    let hairWeight = 0;
+
+    const step = 4;
+    for (let y = 0; y < boxH; y += step) {
+      const ny = (minPxY + y) / height;
+      for (let x = 0; x < boxW; x += step) {
+        const nx = (minPxX + x) / width;
+        const idx = (y * boxW + x) * 4;
+        const r = imgData[idx];
+        const g = imgData[idx + 1];
+        const b = imgData[idx + 2];
+
+        const isSkin =
+          r > 55 &&
+          g > 35 &&
+          b > 20 &&
+          r > g &&
+          g >= b * 0.85 &&
+          r - b > 14 &&
+          r < 245;
+
+        const dist = Math.hypot(nx - prevX, ny - prevY);
+        const w = Math.max(0.1, 1 - dist / searchRadius);
+
+        if (isSkin) {
+          skinSumX += nx * w;
+          skinSumY += ny * w;
+          skinWeight += w;
+        } else if (r < 65 && g < 65 && b < 68 && ny < prevY + prevScale * 0.35) {
+          hairSumX += nx * w;
+          hairWeight += w;
+        }
+      }
+    }
+
+    if (skinWeight < 1.5) {
+      return { centerX: prevX, centerY: prevY, scale: prevScale, yaw: prevYaw };
+    }
+
+    const skinCx = skinSumX / skinWeight;
+    const skinCy = skinSumY / skinWeight;
+
+    let estimatedYaw = prevYaw;
+    if (hairWeight > 1.0) {
+      const hairCx = hairSumX / hairWeight;
+      const deltaX = (skinCx - hairCx) / Math.max(0.15, prevScale);
+      estimatedYaw = Math.max(-62, Math.min(62, deltaX * 95));
+    }
+
+    return {
+      centerX: Math.max(0.12, Math.min(0.88, prevX * 0.35 + skinCx * 0.65)),
+      centerY: Math.max(0.12, Math.min(0.88, prevY * 0.35 + skinCy * 0.65)),
+      scale: prevScale,
+      yaw: estimatedYaw
+    };
+  } catch {
+    return { centerX: prevX, centerY: prevY, scale: prevScale, yaw: prevYaw };
+  }
+}
+
+/**
  * Renders the live camera video frame (at natural un-zoomed field of view) and warps
  * the selected character's face mesh 1:1 onto the live tracked face.
  */

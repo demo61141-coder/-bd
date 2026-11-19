@@ -56,7 +56,8 @@ class FaceTrackerEngine(
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.10f)
+            .setMinFaceSize(0.06f)
+            .enableTracking()
             .build()
         FaceDetection.getClient(options)
     }
@@ -67,7 +68,8 @@ class FaceTrackerEngine(
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.08f)
+            .setMinFaceSize(0.06f)
+            .enableTracking()
             .build()
         FaceDetection.getClient(options)
     }
@@ -85,6 +87,10 @@ class FaceTrackerEngine(
     private var lastFrameTimestampMs = System.currentTimeMillis()
     private var lastRealFacePose: LiveFacePose? = null
     private var lastRealFaceTimestampMs = 0L
+    private var lastYawVelocity = 0f
+    private var lastPitchVelocity = 0f
+    private var lastCenterXVelocity = 0f
+    private var lastCenterYVelocity = 0f
     private var currentFps = 30
 
     @OptIn(ExperimentalGetImage::class)
@@ -111,6 +117,19 @@ class FaceTrackerEngine(
         val frameWidth = if (isRotated90or270) imageProxy.height.toFloat() else imageProxy.width.toFloat()
         val frameHeight = if (isRotated90or270) imageProxy.width.toFloat() else imageProxy.height.toFloat()
 
+        // Estimate head region luminance centroid from Y plane before async callback in case head is turned >55 deg
+        val prevPoseForCentroid = lastRealFacePose
+        val estimatedHeadShift = if (prevPoseForCentroid != null && (now - lastRealFaceTimestampMs) < 3500L) {
+            estimateHeadRegionCentroidInYPlane(
+                mediaImage = mediaImage,
+                rotationDegrees = rotationDegrees,
+                mirrorX = isMirrored,
+                prevCenterX = prevPoseForCentroid.faceCenterX,
+                prevCenterY = prevPoseForCentroid.faceCenterY,
+                prevScale = prevPoseForCentroid.faceScale
+            )
+        } else null
+
         val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
         realtimeDetector.process(inputImage)
             .addOnSuccessListener { faces ->
@@ -124,13 +143,61 @@ class FaceTrackerEngine(
                         mirrorX = isMirrored,
                         fps = currentFps
                     )
+                    val prev = lastRealFacePose
+                    val elapsedSec = ((now - lastRealFaceTimestampMs).coerceIn(16L, 250L)) / 1000f
+                    if (prev != null) {
+                        lastYawVelocity = ((pose.yawDegrees - prev.yawDegrees) / elapsedSec).coerceIn(-120f, 120f)
+                        lastPitchVelocity = ((pose.pitchDegrees - prev.pitchDegrees) / elapsedSec).coerceIn(-90f, 90f)
+                        lastCenterXVelocity = ((pose.faceCenterX - prev.faceCenterX) / elapsedSec).coerceIn(-0.8f, 0.8f)
+                        lastCenterYVelocity = ((pose.faceCenterY - prev.faceCenterY) / elapsedSec).coerceIn(-0.8f, 0.8f)
+                    }
                     lastRealFacePose = pose
                     lastRealFaceTimestampMs = now
                     onLivePoseDetected(pose)
                 } else {
+                    // When the user turns their head sideways while talking (45°..85° profile),
+                    // frontal detectors can drop out temporarily. Keep tracking active using
+                    // kinematic head-turn prediction + Y-plane head centroid tracking!
                     val recent = lastRealFacePose
-                    if (recent != null && (now - lastRealFaceTimestampMs) < 450L) {
-                        onLivePoseDetected(recent.copy(fps = currentFps))
+                    val missingDurationMs = now - lastRealFaceTimestampMs
+                    if (recent != null && missingDurationMs < 4000L) {
+                        val decay = (1f - (missingDurationMs / 4000f)).coerceIn(0.25f, 1f)
+                        val predictedCenterX = estimatedHeadShift?.x
+                            ?: (recent.faceCenterX + lastCenterXVelocity * 0.03f * decay).coerceIn(0.15f, 0.85f)
+                        val predictedCenterY = estimatedHeadShift?.y
+                            ?: (recent.faceCenterY + lastCenterYVelocity * 0.03f * decay).coerceIn(0.15f, 0.85f)
+
+                        // Extrapolate yaw angle toward the direction the user turned their head
+                        val turnDirectionYaw = (recent.yawDegrees + lastYawVelocity * 0.035f * decay)
+                            .coerceIn(-68f, 68f)
+                        val turnPitch = (recent.pitchDegrees + lastPitchVelocity * 0.025f * decay)
+                            .coerceIn(-38f, 38f)
+
+                        val profileControlPoints = transformCanonicalToBox(
+                            centerX = predictedCenterX,
+                            centerY = predictedCenterY,
+                            boxWidth = recent.faceScale * 0.94f,
+                            boxHeight = recent.faceScale * 0.94f,
+                            yawDeg = turnDirectionYaw,
+                            pitchDeg = turnPitch,
+                            rollDeg = recent.rollDegrees,
+                            jawOpen = recent.jawOpen * 0.9f,
+                            blinkLeft = recent.eyeBlinkLeft,
+                            blinkRight = recent.eyeBlinkRight,
+                            smile = recent.smile
+                        )
+
+                        val profilePose = recent.copy(
+                            isTracking = true,
+                            controlPoints = profileControlPoints,
+                            yawDegrees = turnDirectionYaw,
+                            pitchDegrees = turnPitch,
+                            faceCenterX = predictedCenterX,
+                            faceCenterY = predictedCenterY,
+                            fps = currentFps
+                        )
+                        lastRealFacePose = profilePose
+                        onLivePoseDetected(profilePose)
                     } else {
                         onLivePoseDetected(
                             LiveFacePose(
@@ -142,7 +209,12 @@ class FaceTrackerEngine(
                 }
             }
             .addOnFailureListener {
-                onLivePoseDetected(LiveFacePose(isTracking = false, fps = currentFps))
+                val recent = lastRealFacePose
+                if (recent != null && (now - lastRealFaceTimestampMs) < 3000L) {
+                    onLivePoseDetected(recent.copy(fps = currentFps))
+                } else {
+                    onLivePoseDetected(LiveFacePose(isTracking = false, fps = currentFps))
+                }
             }
             .addOnCompleteListener {
                 imageProxy.close()
@@ -472,27 +544,45 @@ class FaceTrackerEngine(
         var boxW = abs(bottomRightMapped.x - topLeftMapped.x).coerceAtLeast(0.08f)
         var boxH = abs(bottomRightMapped.y - topLeftMapped.y).coerceAtLeast(0.08f)
 
-        // Refine center and scale from actual eye-to-eye and eye-to-mouth distances if available
+        // Refine center and scale from actual eye-to-eye distance when frontal,
+        // or single-eye + nose distance when head is turned sideways in profile!
         val rawEye1 = face.getLandmark(FaceLandmark.LEFT_EYE)?.position?.let(pointMapper)
         val rawEye2 = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position?.let(pointMapper)
-        val screenLeftEye = if (rawEye1 != null && rawEye2 != null) {
-            if (rawEye1.x <= rawEye2.x) rawEye1 else rawEye2
-        } else null
-        val screenRightEye = if (rawEye1 != null && rawEye2 != null) {
-            if (rawEye1.x <= rawEye2.x) rawEye2 else rawEye1
-        } else null
-
-        if (screenLeftEye != null && screenRightEye != null) {
-            // In canonical topology, eye centers are at x=0.36 and x=0.64 (span = 0.28 of canonical width 0.64)
-            val interEyeDist = hypot(screenRightEye.x - screenLeftEye.x, screenRightEye.y - screenLeftEye.y)
-            if (interEyeDist > 0.02f) {
-                boxW = (interEyeDist / 0.44f).coerceIn(boxW * 0.70f, boxW * 1.05f)
-            }
-        }
+        val noseLandmark = face.getLandmark(FaceLandmark.NOSE_BASE)?.position?.let(pointMapper)
 
         val yaw = if (mirrorX) -face.headEulerAngleY else face.headEulerAngleY
         val pitch = face.headEulerAngleX
         val roll = if (mirrorX) -face.headEulerAngleZ else face.headEulerAngleZ
+        val absYaw = abs(yaw)
+
+        val screenLeftEye: Point2D?
+        val screenRightEye: Point2D?
+
+        if (rawEye1 != null && rawEye2 != null) {
+            screenLeftEye = if (rawEye1.x <= rawEye2.x) rawEye1 else rawEye2
+            screenRightEye = if (rawEye1.x <= rawEye2.x) rawEye2 else rawEye1
+            val interEyeDist = hypot(screenRightEye.x - screenLeftEye.x, screenRightEye.y - screenLeftEye.y)
+            // Only shrink boxW by interEyeDist when facing mostly forward (absYaw < 22°);
+            // when turning sideways, interEyeDist naturally foreshortens by cos(yaw)
+            val yawCos = cos(Math.toRadians(absYaw.coerceAtMost(60f).toDouble())).toFloat().coerceAtLeast(0.45f)
+            if (interEyeDist > 0.02f) {
+                boxW = ((interEyeDist / yawCos) / 0.44f).coerceIn(boxW * 0.72f, boxW * 1.08f)
+            }
+        } else if (rawEye1 != null || rawEye2 != null) {
+            // Side profile where only one eye is clearly visible
+            val visibleEye = rawEye1 ?: rawEye2!!
+            val horizSpan = boxW * 0.14f * cos(Math.toRadians(absYaw.coerceAtMost(70f).toDouble())).toFloat()
+            if (yaw >= 0f) {
+                screenLeftEye = visibleEye
+                screenRightEye = Point2D(visibleEye.x + horizSpan, visibleEye.y)
+            } else {
+                screenRightEye = visibleEye
+                screenLeftEye = Point2D(visibleEye.x - horizSpan, visibleEye.y)
+            }
+        } else {
+            screenLeftEye = null
+            screenRightEye = null
+        }
 
         val projected = transformCanonicalToBox(
             centerX = centerMapped.x,
@@ -508,9 +598,10 @@ class FaceTrackerEngine(
             smile = smile
         ).toMutableList()
 
-        // Lock left eye diamond (vertices 9..12) to real screen-left eye
+        // Lock left eye diamond (vertices 9..12) with 3D yaw foreshortening on the far eye
         if (screenLeftEye != null) {
-            val ew = boxW * 0.105f
+            val leftEyeYawScale = if (yaw < -15f) (1f - (absYaw - 15f) / 75f).coerceIn(0.35f, 1f) else 1f
+            val ew = boxW * 0.105f * leftEyeYawScale
             val eh = boxH * 0.042f * (1f - blinkLeft * 0.75f)
             projected[9] = Point2D(screenLeftEye.x - ew, screenLeftEye.y)
             projected[10] = Point2D(screenLeftEye.x, screenLeftEye.y - eh)
@@ -518,9 +609,10 @@ class FaceTrackerEngine(
             projected[12] = Point2D(screenLeftEye.x, screenLeftEye.y + eh)
         }
 
-        // Lock right eye diamond (vertices 13..16) to real screen-right eye
+        // Lock right eye diamond (vertices 13..16) with 3D yaw foreshortening on the far eye
         if (screenRightEye != null) {
-            val ew = boxW * 0.105f
+            val rightEyeYawScale = if (yaw > 15f) (1f - (absYaw - 15f) / 75f).coerceIn(0.35f, 1f) else 1f
+            val ew = boxW * 0.105f * rightEyeYawScale
             val eh = boxH * 0.042f * (1f - blinkRight * 0.75f)
             projected[13] = Point2D(screenRightEye.x - ew, screenRightEye.y)
             projected[14] = Point2D(screenRightEye.x, screenRightEye.y - eh)
@@ -529,25 +621,22 @@ class FaceTrackerEngine(
         }
 
         // Lock nose tip & nostrils (vertices 18..20)
-        face.getLandmark(FaceLandmark.NOSE_BASE)?.position?.let { nosePos ->
-            val np = pointMapper(nosePos)
-            projected[18] = np
-            projected[19] = Point2D(np.x - boxW * 0.085f, np.y + boxH * 0.018f)
-            projected[20] = Point2D(np.x + boxW * 0.085f, np.y + boxH * 0.018f)
+        if (noseLandmark != null) {
+            projected[18] = noseLandmark
+            val leftNostrilScale = if (yaw < -10f) 0.45f else 1f
+            val rightNostrilScale = if (yaw > 10f) 0.45f else 1f
+            projected[19] = Point2D(noseLandmark.x - boxW * 0.085f * leftNostrilScale, noseLandmark.y + boxH * 0.018f)
+            projected[20] = Point2D(noseLandmark.x + boxW * 0.085f * rightNostrilScale, noseLandmark.y + boxH * 0.018f)
         }
 
-        // Lock mouth corners & upper/lower lips (vertices 25..30) sorted by screen X!
+        // Lock mouth corners & upper/lower lips (vertices 25..30) sorted by screen X
         val rawM1 = face.getLandmark(FaceLandmark.MOUTH_LEFT)?.position?.let(pointMapper)
         val rawM2 = face.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position?.let(pointMapper)
-        val screenMouthLeft = if (rawM1 != null && rawM2 != null) {
-            if (rawM1.x <= rawM2.x) rawM1 else rawM2
-        } else null
-        val screenMouthRight = if (rawM1 != null && rawM2 != null) {
-            if (rawM1.x <= rawM2.x) rawM2 else rawM1
-        } else null
         val rawMouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM)?.position?.let(pointMapper)
 
-        if (screenMouthLeft != null && screenMouthRight != null) {
+        if (rawM1 != null && rawM2 != null) {
+            val screenMouthLeft = if (rawM1.x <= rawM2.x) rawM1 else rawM2
+            val screenMouthRight = if (rawM1.x <= rawM2.x) rawM2 else rawM1
             val midX = (screenMouthLeft.x + screenMouthRight.x) * 0.5f
             val midY = (screenMouthLeft.y + screenMouthRight.y) * 0.5f
             val mb = rawMouthBottom ?: Point2D(midX, midY + boxH * (0.055f + jawOpen * 0.11f))
@@ -558,9 +647,92 @@ class FaceTrackerEngine(
             projected[29] = Point2D(midX, midY - boxH * 0.008f)
             projected[30] = Point2D(midX, midY + boxH * (0.014f + jawOpen * 0.095f))
             projected[28] = Point2D(mb.x, maxOf(mb.y, midY + boxH * (0.042f + jawOpen * 0.105f)))
+        } else if (rawM1 != null || rawM2 != null || rawMouthBottom != null) {
+            // Side profile where only one mouth corner or lower lip is detected
+            val anchorM = rawMouthBottom ?: rawM1 ?: rawM2!!
+            val halfMouthW = boxW * 0.13f * cos(Math.toRadians(absYaw.coerceAtMost(70f).toDouble())).toFloat()
+            projected[25] = Point2D(anchorM.x - halfMouthW, anchorM.y)
+            projected[27] = Point2D(anchorM.x + halfMouthW, anchorM.y)
+            projected[26] = Point2D(anchorM.x, anchorM.y - boxH * 0.035f)
+            projected[29] = Point2D(anchorM.x, anchorM.y - boxH * 0.008f)
+            projected[30] = Point2D(anchorM.x, anchorM.y + boxH * (0.014f + jawOpen * 0.095f))
+            projected[28] = Point2D(anchorM.x, anchorM.y + boxH * (0.042f + jawOpen * 0.105f))
         }
 
         return projected
+    }
+
+    /**
+     * Lightweight Y-plane region tracker so when a user turns their head >55° into a full side profile,
+     * the head's horizontal & vertical motion continues to be tracked smoothly in real time.
+     */
+    private fun estimateHeadRegionCentroidInYPlane(
+        mediaImage: android.media.Image,
+        rotationDegrees: Int,
+        mirrorX: Boolean,
+        prevCenterX: Float,
+        prevCenterY: Float,
+        prevScale: Float
+    ): Point2D? {
+        return runCatching {
+            val yPlane = mediaImage.planes.firstOrNull() ?: return null
+            val buffer = yPlane.buffer
+            val rowStride = yPlane.rowStride
+            val pixelStride = yPlane.pixelStride
+            val imgW = mediaImage.width
+            val imgH = mediaImage.height
+            if (imgW <= 16 || imgH <= 16) return null
+
+            var sumX = 0f
+            var sumY = 0f
+            var weightSum = 0f
+            val step = 12
+
+            for (y in step until (imgH - step) step step) {
+                for (x in step until (imgW - step) step step) {
+                    val idx = y * rowStride + x * pixelStride
+                    if (idx < 0 || idx >= buffer.limit()) continue
+                    val luma = buffer.get(idx).toInt() and 0xFF
+                    // Mid-tone skin/hair contrast weighting near previous head region
+                    if (luma in 38..215) {
+                        val normX: Float
+                        val normY: Float
+                        when (rotationDegrees) {
+                            90 -> {
+                                normX = 1f - (y.toFloat() / imgH)
+                                normY = x.toFloat() / imgW
+                            }
+                            270 -> {
+                                normX = y.toFloat() / imgH
+                                normY = 1f - (x.toFloat() / imgW)
+                            }
+                            180 -> {
+                                normX = 1f - (x.toFloat() / imgW)
+                                normY = 1f - (y.toFloat() / imgH)
+                            }
+                            else -> {
+                                normX = x.toFloat() / imgW
+                                normY = y.toFloat() / imgH
+                            }
+                        }
+                        val screenX = if (mirrorX) 1f - normX else normX
+                        val dist = hypot(screenX - prevCenterX, normY - prevCenterY)
+                        if (dist < prevScale * 0.95f) {
+                            val w = (1f - dist / (prevScale * 0.95f))
+                            sumX += screenX * w
+                            sumY += normY * w
+                            weightSum += w
+                        }
+                    }
+                }
+            }
+
+            if (weightSum > 2f) {
+                val newX = prevCenterX * 0.72f + (sumX / weightSum) * 0.28f
+                val newY = prevCenterY * 0.72f + (sumY / weightSum) * 0.28f
+                Point2D(newX.coerceIn(0.15f, 0.85f), newY.coerceIn(0.15f, 0.85f))
+            } else null
+        }.getOrNull()
     }
 
     private fun enhanceBitmapContrast(src: Bitmap): Bitmap {
@@ -633,6 +805,12 @@ class FaceTrackerEngine(
     }
 
     companion object {
+        /**
+         * 3D cylindrical head-model projection of the 36 canonical facial vertices.
+         * Supports wide head-turn angles (yaw up to ±75°, pitch up to ±45°, roll ±60°):
+         * - Foreshortens the far side of the face realistically when turning left or right
+         * - Shifts the nose tip and central features along the 3D cylinder arc
+         */
         fun transformCanonicalToBox(
             centerX: Float,
             centerY: Float,
@@ -650,8 +828,12 @@ class FaceTrackerEngine(
             val rollRad = Math.toRadians(rollDeg.toDouble()).toFloat()
             val cosR = cos(rollRad)
             val sinR = sin(rollRad)
-            val yawShift = (yawDeg / 45f).coerceIn(-0.45f, 0.45f)
-            val pitchShift = (pitchDeg / 45f).coerceIn(-0.35f, 0.35f)
+
+            val yawClamped = yawDeg.coerceIn(-75f, 75f)
+            val yawRad = Math.toRadians(yawClamped.toDouble()).toFloat()
+            val sinYaw = sin(yawRad)
+            val cosYaw = cos(yawRad).coerceAtLeast(0.28f)
+            val pitchShift = (pitchDeg / 45f).coerceIn(-0.45f, 0.45f)
 
             return base.mapIndexed { idx, pt ->
                 var lx = pt.x - 0.50f
@@ -682,19 +864,32 @@ class FaceTrackerEngine(
                     33 -> ly += jawOpen * 0.058f
                 }
 
-                val depthFactor = 1f - abs(lx) * 0.35f
-                lx += yawShift * 0.14f * depthFactor
-                ly += pitchShift * 0.11f * depthFactor
+                // 3D cylindrical head depth: nose & center features sit forward on the cylinder,
+                // temples/ears sit further back.
+                val normalizedHoriz = (lx / 0.34f).coerceIn(-1f, 1f)
+                val zDepth = (1f - normalizedHoriz * normalizedHoriz * 0.65f).coerceAtLeast(0.2f)
 
-                val scaledX = lx * (boxWidth / 0.64f)
-                val scaledY = ly * (boxHeight / 0.70f)
+                // Apply 3D yaw rotation: x' = x * cos(yaw) + z * sin(yaw)
+                // Also compress the far side of the face more than the near side for natural side-profile perspective
+                val sideCompression = if (lx * sinYaw < 0f) {
+                    // Far side of face (turned away from camera) compresses strongly
+                    cosYaw * 0.72f
+                } else {
+                    // Near side of face (turned toward camera) stays prominent
+                    (0.65f + 0.35f * cosYaw)
+                }
+                val rotated3DX = lx * sideCompression + zDepth * sinYaw * 0.16f
+                val rotated3DY = ly + pitchShift * 0.12f * zDepth
+
+                val scaledX = rotated3DX * (boxWidth / 0.64f)
+                val scaledY = rotated3DY * (boxHeight / 0.70f)
 
                 val rx = scaledX * cosR - scaledY * sinR
                 val ry = scaledX * sinR + scaledY * cosR
 
                 Point2D(
-                    x = (centerX + rx).coerceIn(-0.1f, 1.1f),
-                    y = (centerY + ry).coerceIn(-0.1f, 1.1f)
+                    x = (centerX + rx).coerceIn(-0.15f, 1.15f),
+                    y = (centerY + ry).coerceIn(-0.15f, 1.15f)
                 )
             }
         }

@@ -40,6 +40,8 @@ data class DetectedVideoFaceSlot(
     val thumbnail: Bitmap,
     val centerX: Float,
     val centerY: Float,
+    val defaultScale: Float = 0.34f,
+    val defaultYaw: Float = 0f,
     val assignedCharacterId: String? = null // null means "Keep Original Face / আসল মুখ"
 )
 
@@ -54,7 +56,9 @@ data class ScannedVideoSession(
     val videoWidth: Int,
     val videoHeight: Int,
     val sampleFrames: List<Bitmap>,
-    val detectedSlots: List<DetectedVideoFaceSlot>
+    val detectedSlots: List<DetectedVideoFaceSlot>,
+    // Pre-computed per-frame multi-face trajectories (supports full side-profile head turns!)
+    val frameTrajectories: List<List<MatchedFrameFace>> = emptyList()
 )
 
 class VideoMultiFaceProcessor(private val context: Context) {
@@ -65,7 +69,7 @@ class VideoMultiFaceProcessor(private val context: Context) {
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-            .setMinFaceSize(0.07f)
+            .setMinFaceSize(0.05f)
             .enableTracking()
             .build()
         FaceDetection.getClient(options)
@@ -73,8 +77,9 @@ class VideoMultiFaceProcessor(private val context: Context) {
 
     /**
      * Scans an uploaded pre-recorded video, extracts sample frames across its timeline,
-     * detects all faces present in the video, and clusters them into distinct [DetectedVideoFaceSlot]s
-     * so the user can assign a different swap character to each person in the video.
+     * detects all faces present in the video, clusters them into distinct [DetectedVideoFaceSlot]s,
+     * and computes a continuous 3D pose trajectory across every frame (interpolating and tracking
+     * skin/head motion during side-profile head turns where frontal detection drops out).
      */
     suspend fun scanUploadedVideo(
         videoUri: Uri,
@@ -96,13 +101,13 @@ class VideoMultiFaceProcessor(private val context: Context) {
             val videoW = if (isRotated) rawH else rawW
             val videoH = if (isRotated) rawW else rawH
 
-            // Sample up to 12 frames across the video timeline for preview playback and face clustering
-            val sampleCount = 12
+            // Sample up to 16 frames across the video timeline for smooth playback & profile interpolation
+            val sampleCount = 16
             val frames = mutableListOf<Bitmap>()
             for (i in 0 until sampleCount) {
                 val timeUs = ((durationMs * 1000L * i) / sampleCount).coerceAtLeast(0L)
-                val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 if (rawFrame != null) {
                     val scaled = scaleFrameForStudio(rawFrame, maxDim = 640)
                     frames.add(scaled)
@@ -114,24 +119,32 @@ class VideoMultiFaceProcessor(private val context: Context) {
             }
             if (frames.isEmpty()) return@withContext null
 
+            // Detect faces on all sampled frames (with contrast enhancement fallback for backlit outdoor shots)
+            val rawDetectionsPerFrame = frames.map { frame ->
+                val direct = detectFacesInBitmap(frame)
+                if (direct.isNotEmpty()) direct else detectFacesInBitmap(enhanceOutdoorFrame(frame))
+            }
+
             // Cluster all faces detected across the sampled frames
             val slots = mutableListOf<DetectedVideoFaceSlot>()
 
-            for (frame in frames) {
-                val faces = detectFacesInBitmap(frame)
+            for (frameIdx in frames.indices) {
+                val frame = frames[frameIdx]
+                val faces = rawDetectionsPerFrame[frameIdx]
                 val fw = frame.width.toFloat().coerceAtLeast(1f)
                 val fh = frame.height.toFloat().coerceAtLeast(1f)
 
-                // Sort left-to-right for deterministic person numbering
                 val sortedFaces = faces.sortedBy { it.boundingBox.exactCenterX() }
                 for (face in sortedFaces) {
                     val cx = (face.boundingBox.exactCenterX() / fw).coerceIn(0.05f, 0.95f)
                     val cy = (face.boundingBox.exactCenterY() / fh).coerceIn(0.05f, 0.95f)
+                    val bw = (face.boundingBox.width() / fw).coerceIn(0.12f, 0.85f)
+                    val bh = (face.boundingBox.height() / fh).coerceIn(0.12f, 0.85f)
                     val trackId = face.trackingId
 
                     val existingIdx = slots.indexOfFirst { slot ->
                         (trackId != null && slot.trackingId == trackId) ||
-                            hypot(slot.centerX - cx, slot.centerY - cy) < 0.17f
+                            hypot(slot.centerX - cx, slot.centerY - cy) < 0.22f
                     }
 
                     if (existingIdx == -1 && slots.size < 6) {
@@ -146,7 +159,8 @@ class VideoMultiFaceProcessor(private val context: Context) {
                                 thumbnail = thumb,
                                 centerX = cx,
                                 centerY = cy,
-                                // Auto-assign the first detected face to the currently selected character
+                                defaultScale = (bw + bh) * 0.5f,
+                                defaultYaw = face.headEulerAngleY,
                                 assignedCharacterId = if (slots.isEmpty()) defaultCharacterId else null
                             )
                         )
@@ -154,23 +168,33 @@ class VideoMultiFaceProcessor(private val context: Context) {
                 }
             }
 
-            // If a video had very low light or small faces and 0 slots were auto-clustered,
-            // create a default center face slot from the first frame so the user can still swap
+            // If a video consists entirely of a side-profile head turn where ML Kit missed every frame,
+            // locate the person's head & skin region automatically so the face slot is still detected and tracked!
             if (slots.isEmpty()) {
                 val first = frames.first()
+                val profileEst = estimateProfileHeadInBitmap(first, prevX = 0.52f, prevY = 0.42f, prevScale = 0.34f)
                 slots.add(
                     DetectedVideoFaceSlot(
                         slotIndex = 0,
                         trackingId = null,
                         labelBn = "মুখ #১",
                         labelEn = "Face #1",
-                        thumbnail = cropCenterThumbnail(first),
-                        centerX = 0.50f,
-                        centerY = 0.42f,
+                        thumbnail = cropRegionThumbnail(first, profileEst.centerX, profileEst.centerY, profileEst.scale),
+                        centerX = profileEst.centerX,
+                        centerY = profileEst.centerY,
+                        defaultScale = profileEst.scale,
+                        defaultYaw = profileEst.estimatedYaw,
                         assignedCharacterId = defaultCharacterId
                     )
                 )
             }
+
+            // Build complete per-frame trajectories with side-profile tracking & temporal interpolation
+            val trajectories = buildContinuousFrameTrajectories(
+                frames = frames,
+                rawDetectionsPerFrame = rawDetectionsPerFrame,
+                slots = slots
+            )
 
             ScannedVideoSession(
                 videoUri = videoUri,
@@ -178,7 +202,8 @@ class VideoMultiFaceProcessor(private val context: Context) {
                 videoWidth = videoW,
                 videoHeight = videoH,
                 sampleFrames = frames,
-                detectedSlots = slots
+                detectedSlots = slots,
+                frameTrajectories = trajectories
             )
         } catch (_: Exception) {
             null
@@ -188,44 +213,183 @@ class VideoMultiFaceProcessor(private val context: Context) {
     }
 
     /**
-     * Detects all faces in a single video frame and matches each detected face to its
-     * corresponding [DetectedVideoFaceSlot].
+     * Builds a smooth, uninterrupted 3D face pose trajectory for every detected person across all
+     * frames of the video. When a person turns their head sideways (>45°..80° profile) and frontal
+     * detection misses that frame, we combine skin/head region tracking with bi-directional
+     * trajectory interpolation so the swapped face turns naturally with their head and never vanishes!
      */
-    suspend fun matchFacesInFrame(
-        frame: Bitmap,
+    private fun buildContinuousFrameTrajectories(
+        frames: List<Bitmap>,
+        rawDetectionsPerFrame: List<List<Face>>,
         slots: List<DetectedVideoFaceSlot>
-    ): List<MatchedFrameFace> {
-        val faces = detectFacesInBitmap(frame)
-        val fw = frame.width.toFloat().coerceAtLeast(1f)
-        val fh = frame.height.toFloat().coerceAtLeast(1f)
+    ): List<List<MatchedFrameFace>> {
+        val frameCount = frames.size
+        // slotPoses[slotIdx][frameIdx]
+        val slotPoses = Array(slots.size) { arrayOfNulls<LiveFacePose>(frameCount) }
 
-        if (faces.isEmpty()) {
-            return slots.map { slot ->
+        // Step 1: Assign directly detected ML Kit faces to their corresponding slot
+        for (fIdx in 0 until frameCount) {
+            val frame = frames[fIdx]
+            val fw = frame.width.toFloat().coerceAtLeast(1f)
+            val fh = frame.height.toFloat().coerceAtLeast(1f)
+            val faces = rawDetectionsPerFrame[fIdx]
+            val usedSlots = mutableSetOf<Int>()
+
+            for (face in faces) {
+                val cx = (face.boundingBox.exactCenterX() / fw).coerceIn(0.05f, 0.95f)
+                val cy = (face.boundingBox.exactCenterY() / fh).coerceIn(0.05f, 0.95f)
+                val trackId = face.trackingId
+
+                val matchedSlot = slots
+                    .filter { it.slotIndex !in usedSlots }
+                    .minByOrNull { slot ->
+                        if (trackId != null && slot.trackingId == trackId) 0f
+                        else hypot(slot.centerX - cx, slot.centerY - cy)
+                    } ?: continue
+
+                usedSlots.add(matchedSlot.slotIndex)
+                slotPoses[matchedSlot.slotIndex][fIdx] = mapVideoFaceToPose(face, fw, fh)
+            }
+        }
+
+        // Step 2: Fill side-profile gaps for each slot using skin/head centroid tracking + yaw interpolation
+        for (sIdx in slots.indices) {
+            val slot = slots[sIdx]
+            val poses = slotPoses[sIdx]
+
+            for (fIdx in 0 until frameCount) {
+                if (poses[fIdx] != null) continue
+
+                // Find nearest previous and next detected frames for this person
+                var prevIdx = fIdx - 1
+                while (prevIdx >= 0 && poses[prevIdx] == null) prevIdx--
+                var nextIdx = fIdx + 1
+                while (nextIdx < frameCount && poses[nextIdx] == null) nextIdx++
+
+                val prevPose = if (prevIdx >= 0) poses[prevIdx] else null
+                val nextPose = if (nextIdx < frameCount) poses[nextIdx] else null
+
+                val anchorX: Float
+                val anchorY: Float
+                val anchorScale: Float
+                val baseYaw: Float
+                val basePitch: Float
+                val baseRoll: Float
+                val baseJaw: Float
+
+                when {
+                    prevPose != null && nextPose != null -> {
+                        val t = (fIdx - prevIdx).toFloat() / (nextIdx - prevIdx).coerceAtLeast(1)
+                        anchorX = prevPose.faceCenterX + (nextPose.faceCenterX - prevPose.faceCenterX) * t
+                        anchorY = prevPose.faceCenterY + (nextPose.faceCenterY - prevPose.faceCenterY) * t
+                        anchorScale = prevPose.faceScale + (nextPose.faceScale - prevPose.faceScale) * t
+                        baseYaw = prevPose.yawDegrees + (nextPose.yawDegrees - prevPose.yawDegrees) * t
+                        basePitch = prevPose.pitchDegrees + (nextPose.pitchDegrees - prevPose.pitchDegrees) * t
+                        baseRoll = prevPose.rollDegrees + (nextPose.rollDegrees - prevPose.rollDegrees) * t
+                        baseJaw = prevPose.jawOpen + (nextPose.jawOpen - prevPose.jawOpen) * t
+                    }
+                    prevPose != null -> {
+                        anchorX = prevPose.faceCenterX
+                        anchorY = prevPose.faceCenterY
+                        anchorScale = prevPose.faceScale
+                        baseYaw = prevPose.yawDegrees
+                        basePitch = prevPose.pitchDegrees
+                        baseRoll = prevPose.rollDegrees
+                        baseJaw = prevPose.jawOpen
+                    }
+                    nextPose != null -> {
+                        anchorX = nextPose.faceCenterX
+                        anchorY = nextPose.faceCenterY
+                        anchorScale = nextPose.faceScale
+                        baseYaw = nextPose.yawDegrees
+                        basePitch = nextPose.pitchDegrees
+                        baseRoll = nextPose.rollDegrees
+                        baseJaw = nextPose.jawOpen
+                    }
+                    else -> {
+                        anchorX = slot.centerX
+                        anchorY = slot.centerY
+                        anchorScale = slot.defaultScale
+                        baseYaw = slot.defaultYaw
+                        basePitch = 0f
+                        baseRoll = 0f
+                        baseJaw = 0.06f
+                    }
+                }
+
+                // Refine position & side-profile yaw angle directly from the current video frame's skin/hair distribution!
+                val profileEst = estimateProfileHeadInBitmap(
+                    frame = frames[fIdx],
+                    prevX = anchorX,
+                    prevY = anchorY,
+                    prevScale = anchorScale
+                )
+
+                // If frontal detection missed this frame, the head is almost certainly turned in side profile (±42°..65°)
+                val finalYaw = if (abs(profileEst.estimatedYaw) > abs(baseYaw)) {
+                    profileEst.estimatedYaw
+                } else if (abs(baseYaw) < 20f) {
+                    // Push toward detected profile orientation
+                    profileEst.estimatedYaw
+                } else {
+                    baseYaw.coerceIn(-68f, 68f)
+                }
+
                 val controlPts = FaceTrackerEngine.transformCanonicalToBox(
-                    centerX = slot.centerX,
-                    centerY = slot.centerY,
-                    boxWidth = 0.34f,
-                    boxHeight = 0.36f,
-                    yawDeg = 0f,
-                    pitchDeg = 0f,
-                    rollDeg = 0f,
-                    jawOpen = 0.06f,
+                    centerX = profileEst.centerX,
+                    centerY = profileEst.centerY,
+                    boxWidth = profileEst.scale * 0.94f,
+                    boxHeight = profileEst.scale * 0.94f,
+                    yawDeg = finalYaw,
+                    pitchDeg = basePitch,
+                    rollDeg = baseRoll,
+                    jawOpen = baseJaw,
                     blinkLeft = 0f,
                     blinkRight = 0f,
                     smile = 0.15f
                 )
-                MatchedFrameFace(
-                    slotIndex = slot.slotIndex,
-                    pose = LiveFacePose(
-                        isTracking = true,
-                        controlPoints = controlPts,
-                        faceCenterX = slot.centerX,
-                        faceCenterY = slot.centerY,
-                        faceScale = 0.34f
-                    )
+
+                poses[fIdx] = LiveFacePose(
+                    isTracking = true,
+                    controlPoints = controlPts,
+                    jawOpen = baseJaw,
+                    yawDegrees = finalYaw,
+                    pitchDegrees = basePitch,
+                    rollDegrees = baseRoll,
+                    faceCenterX = profileEst.centerX,
+                    faceCenterY = profileEst.centerY,
+                    faceScale = profileEst.scale
                 )
             }
         }
+
+        // Convert to per-frame list of MatchedFrameFace
+        return List(frameCount) { fIdx ->
+            slots.mapNotNull { slot ->
+                val p = slotPoses[slot.slotIndex][fIdx]
+                if (p != null) MatchedFrameFace(slotIndex = slot.slotIndex, pose = p) else null
+            }
+        }
+    }
+
+    /**
+     * Returns the matched face poses for a given frame, using the precomputed continuous trajectory
+     * if available or running live detection + profile estimation on the fly.
+     */
+    suspend fun matchFacesInFrame(
+        frame: Bitmap,
+        slots: List<DetectedVideoFaceSlot>,
+        frameIndex: Int = -1,
+        session: ScannedVideoSession? = null
+    ): List<MatchedFrameFace> {
+        if (session != null && frameIndex in session.frameTrajectories.indices) {
+            return session.frameTrajectories[frameIndex]
+        }
+
+        val directFaces = detectFacesInBitmap(frame)
+        val faces = if (directFaces.isNotEmpty()) directFaces else detectFacesInBitmap(enhanceOutdoorFrame(frame))
+        val fw = frame.width.toFloat().coerceAtLeast(1f)
+        val fh = frame.height.toFloat().coerceAtLeast(1f)
 
         val usedSlots = mutableSetOf<Int>()
         val results = mutableListOf<MatchedFrameFace>()
@@ -251,6 +415,40 @@ class VideoMultiFaceProcessor(private val context: Context) {
                 results.add(MatchedFrameFace(slotIndex = matchedSlot.slotIndex, pose = pose))
             }
         }
+
+        // For any slot whose face is turned into a side profile on this frame, estimate its side-profile pose
+        for (slot in slots) {
+            if (slot.slotIndex !in usedSlots) {
+                val est = estimateProfileHeadInBitmap(frame, slot.centerX, slot.centerY, slot.defaultScale)
+                val controlPts = FaceTrackerEngine.transformCanonicalToBox(
+                    centerX = est.centerX,
+                    centerY = est.centerY,
+                    boxWidth = est.scale * 0.94f,
+                    boxHeight = est.scale * 0.94f,
+                    yawDeg = est.estimatedYaw,
+                    pitchDeg = 0f,
+                    rollDeg = 0f,
+                    jawOpen = 0.06f,
+                    blinkLeft = 0f,
+                    blinkRight = 0f,
+                    smile = 0.15f
+                )
+                results.add(
+                    MatchedFrameFace(
+                        slotIndex = slot.slotIndex,
+                        pose = LiveFacePose(
+                            isTracking = true,
+                            controlPoints = controlPts,
+                            yawDegrees = est.estimatedYaw,
+                            faceCenterX = est.centerX,
+                            faceCenterY = est.centerY,
+                            faceScale = est.scale
+                        )
+                    )
+                )
+            }
+        }
+
         return results
     }
 
@@ -314,9 +512,9 @@ class VideoMultiFaceProcessor(private val context: Context) {
             val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
             for (step in 0 until totalSteps) {
-                val frameIdx = (step * frames.size) / totalSteps
-                val rawFrame = frames[frameIdx.coerceIn(0, frames.lastIndex)]
-                val matched = matchFacesInFrame(rawFrame, slots)
+                val frameIdx = ((step * frames.size) / totalSteps).coerceIn(0, frames.lastIndex)
+                val rawFrame = frames[frameIdx]
+                val matched = matchFacesInFrame(rawFrame, slots, frameIndex = frameIdx, session = session)
                 val composited = renderMultiFaceFrame(
                     sourceFrame = rawFrame,
                     matchedFaces = matched,
@@ -348,6 +546,135 @@ class VideoMultiFaceProcessor(private val context: Context) {
         } catch (_: Exception) {
             recorder.stopRecording()?.file
         }
+    }
+
+    private data class ProfileHeadEstimate(
+        val centerX: Float,
+        val centerY: Float,
+        val scale: Float,
+        val estimatedYaw: Float
+    )
+
+    /**
+     * Detects the position, scale, and left/right profile yaw direction of a person's head
+     * when they turn sideways (45°..85° side profile) by analyzing the spatial distribution of
+     * skin-tone pixels (facial profile) vs dark hair pixels (back of the head) around the search window.
+     */
+    private fun estimateProfileHeadInBitmap(
+        frame: Bitmap,
+        prevX: Float,
+        prevY: Float,
+        prevScale: Float
+    ): ProfileHeadEstimate {
+        val w = frame.width
+        val h = frame.height
+        if (w < 16 || h < 16) {
+            return ProfileHeadEstimate(prevX, prevY, prevScale, 0f)
+        }
+
+        var skinSumX = 0f
+        var skinSumY = 0f
+        var skinWeight = 0f
+
+        var hairSumX = 0f
+        var hairWeight = 0f
+
+        val step = 6
+        val searchRadius = (prevScale * 1.15f).coerceIn(0.22f, 0.55f)
+
+        for (py in step until (h - step) step step) {
+            val ny = py.toFloat() / h
+            if (abs(ny - prevY) > searchRadius) continue
+
+            for (px in step until (w - step) step step) {
+                val nx = px.toFloat() / w
+                if (abs(nx - prevX) > searchRadius) continue
+
+                val pixel = frame.getPixel(px, py)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+
+                // Warm skin-tone chrominance rule (works across South Asian and diverse skin tones in outdoor/indoor light)
+                val isSkin = r > 55 && g > 35 && b > 20 &&
+                    r > g && g >= (b * 0.85f).toInt() &&
+                    (r - b) > 14 && r < 245
+
+                val dist = hypot(nx - prevX, ny - prevY)
+                val spatialWeight = (1f - (dist / searchRadius)).coerceAtLeast(0.1f)
+
+                if (isSkin) {
+                    skinSumX += nx * spatialWeight
+                    skinSumY += ny * spatialWeight
+                    skinWeight += spatialWeight
+                } else if (r < 65 && g < 65 && b < 68 && ny < prevY + prevScale * 0.35f) {
+                    // Dark hair region on top/back of the head
+                    hairSumX += nx * spatialWeight
+                    hairWeight += spatialWeight
+                }
+            }
+        }
+
+        if (skinWeight < 1.5f) {
+            return ProfileHeadEstimate(prevX, prevY, prevScale, 0f)
+        }
+
+        val skinCx = (skinSumX / skinWeight).coerceIn(0.12f, 0.88f)
+        val skinCy = (skinSumY / skinWeight).coerceIn(0.12f, 0.88f)
+
+        // Compare skin centroid (front of face) vs hair centroid (back of head) to infer left/right profile turn!
+        val estimatedYaw = if (hairWeight > 1.0f) {
+            val hairCx = hairSumX / hairWeight
+            // If skin is to the LEFT of hair (skinCx < hairCx), the person is looking LEFT (negative yaw),
+            // just like in the user's outdoor side-profile video screenshot!
+            val deltaX = (skinCx - hairCx) / prevScale.coerceAtLeast(0.15f)
+            (deltaX * 95f).coerceIn(-62f, 62f)
+        } else {
+            0f
+        }
+
+        // Blend smoothly with previous anchor so the face glides naturally with the head
+        val finalCx = (prevX * 0.35f + skinCx * 0.65f).coerceIn(0.12f, 0.88f)
+        val finalCy = (prevY * 0.35f + skinCy * 0.65f).coerceIn(0.12f, 0.88f)
+
+        return ProfileHeadEstimate(
+            centerX = finalCx,
+            centerY = finalCy,
+            scale = prevScale.coerceIn(0.20f, 0.65f),
+            estimatedYaw = estimatedYaw
+        )
+    }
+
+    private fun enhanceOutdoorFrame(src: Bitmap): Bitmap {
+        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val cm = android.graphics.ColorMatrix(
+            floatArrayOf(
+                1.22f, 0f, 0f, 0f, 18f,
+                0f, 1.22f, 0f, 0f, 18f,
+                0f, 0f, 1.22f, 0f, 18f,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = android.graphics.ColorMatrixColorFilter(cm)
+        }
+        canvas.drawBitmap(src, 0f, 0f, paint)
+        return out
+    }
+
+    private fun cropRegionThumbnail(frame: Bitmap, cxNorm: Float, cyNorm: Float, scaleNorm: Float): Bitmap {
+        val w = frame.width
+        val h = frame.height
+        val halfSize = (minOf(w, h) * scaleNorm * 0.7f).toInt().coerceAtLeast(24)
+        val cx = (cxNorm * w).toInt()
+        val cy = (cyNorm * h).toInt()
+        val left = (cx - halfSize).coerceIn(0, (w - 16).coerceAtLeast(0))
+        val top = (cy - halfSize).coerceIn(0, (h - 16).coerceAtLeast(0))
+        val right = (cx + halfSize).coerceIn(left + 16, w)
+        val bottom = (cy + halfSize).coerceIn(top + 16, h)
+        val cropped = Bitmap.createBitmap(frame, left, top, right - left, bottom - top)
+        return Bitmap.createScaledBitmap(cropped, 160, 160, true)
     }
 
     private suspend fun detectFacesInBitmap(bitmap: Bitmap): List<Face> =

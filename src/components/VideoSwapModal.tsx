@@ -2,7 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { FaceLandmarker } from '@mediapipe/tasks-vision';
 import { CharacterItem, LiveBlendshapes, Point2D, StudioSettings } from '../types';
-import { drawWarpedCharacterOverlay } from '../utils/webglRenderer';
+import {
+  drawWarpedCharacterOverlay,
+  estimateProfileHeadInCanvas,
+  projectCanonical36ToBox
+} from '../utils/webglRenderer';
 
 export interface WebDetectedFaceSlot {
   slotIndex: number;
@@ -11,6 +15,8 @@ export interface WebDetectedFaceSlot {
   thumbnailDataUrl: string;
   centerX: number;
   centerY: number;
+  defaultScale: number;
+  defaultYaw: number;
   assignedCharacterId: string | null; // null = Keep Original Face
 }
 
@@ -176,6 +182,8 @@ export const VideoSwapModal: React.FC<Props> = ({
                 thumbnailDataUrl: thumbCanvas.toDataURL('image/jpeg', 0.85),
                 centerX: cx,
                 centerY: cy,
+                defaultScale: Math.max(0.22, ((maxX - minX) + (maxY - minY)) * 0.5),
+                defaultYaw: 0,
                 assignedCharacterId: slots.length === 0 ? defaultCharacterId : null
               });
             }
@@ -195,17 +203,32 @@ export const VideoSwapModal: React.FC<Props> = ({
     }
 
     if (slots.length === 0) {
+      const est = estimateProfileHeadInCanvas(offCtx, vw, vh, 0.52, 0.42, 0.34, -45);
       const thumbCanvas = document.createElement('canvas');
       thumbCanvas.width = 128;
       thumbCanvas.height = 128;
-      thumbCanvas.getContext('2d')!.drawImage(offCanvas, vw * 0.25, vh * 0.2, vw * 0.5, vh * 0.5, 0, 0, 128, 128);
+      thumbCanvas
+        .getContext('2d')!
+        .drawImage(
+          offCanvas,
+          Math.max(0, (est.centerX - 0.22) * vw),
+          Math.max(0, (est.centerY - 0.22) * vh),
+          vw * 0.44,
+          vh * 0.44,
+          0,
+          0,
+          128,
+          128
+        );
       slots.push({
         slotIndex: 0,
         labelBn: 'মুখ #১',
         labelEn: 'Face #1',
         thumbnailDataUrl: thumbCanvas.toDataURL('image/jpeg', 0.85),
-        centerX: 0.5,
-        centerY: 0.45,
+        centerX: est.centerX,
+        centerY: est.centerY,
+        defaultScale: est.scale,
+        defaultYaw: est.yaw,
         assignedCharacterId: defaultCharacterId
       });
     }
@@ -216,10 +239,14 @@ export const VideoSwapModal: React.FC<Props> = ({
     onShowToast(`ভিডিওতে ${slots.length}টি মুখ পাওয়া গেছে! / Found ${slots.length} faces in video!`);
   };
 
-  // Real-time multi-face playback render loop on the uploaded video
+  // Real-time multi-face playback render loop on the uploaded video (with side-profile tracking!)
   useEffect(() => {
     if (!videoUrl || isScanning) return;
     let animId = 0;
+    const slotLiveMemory = new Map<
+      number,
+      { centerX: number; centerY: number; scale: number; yaw: number; roll: number; jawOpen: number }
+    >();
 
     const renderVideoFrame = () => {
       const video = uploadedVideoRef.current;
@@ -235,13 +262,14 @@ export const VideoSwapModal: React.FC<Props> = ({
           const ch = canvas.height;
           ctx.drawImage(video, 0, 0, cw, ch);
 
+          const usedSlots = new Set<number>();
+
           if (landmarker) {
             try {
               const nowMs = Math.max(performance.now(), lastTimestampRef.current + 1);
               lastTimestampRef.current = nowMs;
               const res = landmarker.detectForVideo(video, nowMs);
               const faceLandmarksList = res.faceLandmarks || [];
-              const usedSlots = new Set<number>();
 
               faceLandmarksList.forEach((lm478, faceIdx) => {
                 const nose = lm478[1] || { x: 0.5, y: 0.5 };
@@ -249,7 +277,8 @@ export const VideoSwapModal: React.FC<Props> = ({
                 let bestDist = 999;
                 for (const s of detectedSlots) {
                   if (usedSlots.has(s.slotIndex)) continue;
-                  const d = Math.hypot(s.centerX - nose.x, s.centerY - nose.y);
+                  const mem = slotLiveMemory.get(s.slotIndex) || s;
+                  const d = Math.hypot(mem.centerX - nose.x, mem.centerY - nose.y);
                   if (d < bestDist) {
                     bestDist = d;
                     bestSlot = s;
@@ -258,51 +287,138 @@ export const VideoSwapModal: React.FC<Props> = ({
                 if (!bestSlot && detectedSlots.length > 0) {
                   bestSlot = detectedSlots[faceIdx % detectedSlots.length];
                 }
-                if (bestSlot && bestSlot.assignedCharacterId) {
+                if (bestSlot) {
                   usedSlots.add(bestSlot.slotIndex);
-                  const assignedChar = characters.find((c) => c.id === bestSlot!.assignedCharacterId);
-                  const charImg = assignedChar ? charImagesMapRef.current.get(assignedChar.id) : null;
-                  if (assignedChar && charImg && charImg.complete) {
-                    const pts36: Point2D[] = mpTo36Indices.map((idx) => {
-                      const pt = lm478[idx] || { x: 0.5, y: 0.5 };
-                      return { x: pt.x, y: pt.y };
-                    });
-                    const cats = res.faceBlendshapes?.[faceIdx]?.categories || [];
-                    const findScore = (name: string) => cats.find((c) => c.categoryName === name)?.score || 0;
-                    const le = pts36[9];
-                    const re = pts36[15];
-                    const ns = pts36[18];
-                    const eyeDist = Math.max(0.05, Math.hypot(re.x - le.x, re.y - le.y));
-                    const rollDeg = (Math.atan2(re.y - le.y, re.x - le.x) * 180) / Math.PI;
-                    const yawDeg = ((ns.x - (le.x + re.x) * 0.5) / eyeDist) * 45;
 
-                    const blendshapes: LiveBlendshapes = {
-                      jawOpen: findScore('jawOpen'),
-                      eyeBlinkLeft: findScore('eyeBlinkLeft'),
-                      eyeBlinkRight: findScore('eyeBlinkRight'),
-                      yaw: yawDeg,
-                      pitch: 0,
-                      roll: rollDeg
-                    };
+                  let minX = 1, minY = 1, maxX = 0, maxY = 0;
+                  const pts36: Point2D[] = mpTo36Indices.map((idx) => {
+                    const pt = lm478[idx] || { x: 0.5, y: 0.5 };
+                    if (pt.x < minX) minX = pt.x;
+                    if (pt.y < minY) minY = pt.y;
+                    if (pt.x > maxX) maxX = pt.x;
+                    if (pt.y > maxY) maxY = pt.y;
+                    return { x: pt.x, y: pt.y };
+                  });
 
-                    drawWarpedCharacterOverlay(
-                      ctx,
-                      cw,
-                      ch,
-                      charImg,
-                      assignedChar,
-                      pts36,
-                      blendshapes,
-                      settings.blendOpacity,
-                      settings.detailedMouthInterior,
-                      false
-                    );
+                  const cats = res.faceBlendshapes?.[faceIdx]?.categories || [];
+                  const findScore = (name: string) => cats.find((c) => c.categoryName === name)?.score || 0;
+                  const le = pts36[9];
+                  const re = pts36[15];
+                  const ns = pts36[18];
+                  const eyeDist = Math.max(0.04, Math.hypot(re.x - le.x, re.y - le.y));
+                  const rollDeg = (Math.atan2(re.y - le.y, re.x - le.x) * 180) / Math.PI;
+                  const yawDeg = ((ns.x - (le.x + re.x) * 0.5) / eyeDist) * 52;
+                  const jawOpen = findScore('jawOpen');
+
+                  slotLiveMemory.set(bestSlot.slotIndex, {
+                    centerX: (minX + maxX) * 0.5,
+                    centerY: (minY + maxY) * 0.5,
+                    scale: Math.max(0.18, ((maxX - minX) + (maxY - minY)) * 0.5),
+                    yaw: yawDeg,
+                    roll: rollDeg,
+                    jawOpen
+                  });
+
+                  if (bestSlot.assignedCharacterId) {
+                    const assignedChar = characters.find((c) => c.id === bestSlot!.assignedCharacterId);
+                    const charImg = assignedChar ? charImagesMapRef.current.get(assignedChar.id) : null;
+                    if (assignedChar && charImg && charImg.complete) {
+                      const blendshapes: LiveBlendshapes = {
+                        jawOpen,
+                        eyeBlinkLeft: findScore('eyeBlinkLeft'),
+                        eyeBlinkRight: findScore('eyeBlinkRight'),
+                        yaw: yawDeg,
+                        pitch: 0,
+                        roll: rollDeg
+                      };
+
+                      drawWarpedCharacterOverlay(
+                        ctx,
+                        cw,
+                        ch,
+                        charImg,
+                        assignedChar,
+                        pts36,
+                        blendshapes,
+                        settings.blendOpacity,
+                        settings.detailedMouthInterior,
+                        false
+                      );
+                    }
                   }
                 }
               });
             } catch {
               // ignore frame error
             }
+          }
+
+          // Side-Profile Head-Turn Fallback: For any face slot that turned sideways (>45°..85° profile)
+          // on this frame so MediaPipe frontal detection missed it, track the person's head & skin profile
+          // directly from the video frame and render the 3D yaw-foreshortened character face!
+          for (const slot of detectedSlots) {
+            if (usedSlots.has(slot.slotIndex) || !slot.assignedCharacterId) continue;
+            const assignedChar = characters.find((c) => c.id === slot.assignedCharacterId);
+            const charImg = assignedChar ? charImagesMapRef.current.get(assignedChar.id) : null;
+            if (!assignedChar || !charImg || !charImg.complete) continue;
+
+            const prev = slotLiveMemory.get(slot.slotIndex) || {
+              centerX: slot.centerX,
+              centerY: slot.centerY,
+              scale: slot.defaultScale || 0.34,
+              yaw: slot.defaultYaw || -45,
+              roll: 0,
+              jawOpen: 0.06
+            };
+
+            const est = estimateProfileHeadInCanvas(
+              ctx,
+              cw,
+              ch,
+              prev.centerX,
+              prev.centerY,
+              prev.scale,
+              prev.yaw
+            );
+            slotLiveMemory.set(slot.slotIndex, {
+              ...prev,
+              centerX: est.centerX,
+              centerY: est.centerY,
+              yaw: est.yaw
+            });
+
+            const profilePts36 = projectCanonical36ToBox(
+              est.centerX,
+              est.centerY,
+              est.scale,
+              est.scale * 1.05,
+              est.yaw,
+              0,
+              prev.roll,
+              prev.jawOpen,
+              0,
+              0
+            );
+
+            drawWarpedCharacterOverlay(
+              ctx,
+              cw,
+              ch,
+              charImg,
+              assignedChar,
+              profilePts36,
+              {
+                jawOpen: prev.jawOpen,
+                eyeBlinkLeft: 0,
+                eyeBlinkRight: 0,
+                yaw: est.yaw,
+                pitch: 0,
+                roll: prev.roll
+              },
+              settings.blendOpacity,
+              settings.detailedMouthInterior,
+              false
+            );
           }
         }
       }

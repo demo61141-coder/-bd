@@ -22,6 +22,8 @@ import { OneEuroLandmarkBank } from './utils/oneEuroFilter';
 import {
   computeVideoDrawRect,
   createFaceCutoutFromLandmarks,
+  estimateProfileHeadInCanvas,
+  projectCanonical36ToBox,
   renderCompositeCanvasFrame
 } from './utils/webglRenderer';
 import { ManualSetupModal } from './components/ManualSetupModal';
@@ -74,6 +76,15 @@ export const App: React.FC = () => {
   const lastDetectTimestampRef = useRef<number>(0);
   const lastTrackedPtsRef = useRef<Point2D[]>(CANONICAL_36_POINTS);
   const lastTrackedTimeRef = useRef<number>(0);
+  const lastHeadPoseRef = useRef({
+    centerX: 0.5,
+    centerY: 0.45,
+    scale: 0.34,
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+    jawOpen: 0.05
+  });
   const filterBankRef = useRef(new OneEuroLandmarkBank());
   const activeCharImgRef = useRef<HTMLImageElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -103,7 +114,7 @@ export const App: React.FC = () => {
     img.src = selectedChar.imageDataUrl;
   }, [selectedChar]);
 
-  // Initialize MediaPipe Face Landmarker (GPU with CPU fallback)
+  // Initialize MediaPipe Face Landmarker (GPU with CPU fallback, lowered thresholds for side profile)
   useEffect(() => {
     let cancelled = false;
     async function initMediaPipe() {
@@ -122,9 +133,9 @@ export const App: React.FC = () => {
             outputFaceBlendshapes: true,
             runningMode: 'VIDEO',
             numFaces: 1,
-            minFaceDetectionConfidence: 0.35,
-            minFacePresenceConfidence: 0.35,
-            minTrackingConfidence: 0.35
+            minFaceDetectionConfidence: 0.22,
+            minFacePresenceConfidence: 0.22,
+            minTrackingConfidence: 0.22
           });
         } catch {
           landmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -136,9 +147,9 @@ export const App: React.FC = () => {
             outputFaceBlendshapes: true,
             runningMode: 'VIDEO',
             numFaces: 1,
-            minFaceDetectionConfidence: 0.35,
-            minFacePresenceConfidence: 0.35,
-            minTrackingConfidence: 0.35
+            minFaceDetectionConfidence: 0.22,
+            minFacePresenceConfidence: 0.22,
+            minTrackingConfidence: 0.22
           });
         }
         if (!cancelled) {
@@ -165,7 +176,6 @@ export const App: React.FC = () => {
         setPermissionError(null);
         let stream: MediaStream;
         try {
-          // Request natural 4:3 sensor aspect ratio so the camera is not digitally cropped/zoomed
           stream = await navigator.mediaDevices.getUserMedia({
             video: {
               facingMode: settings.facingMode,
@@ -181,7 +191,6 @@ export const App: React.FC = () => {
           });
         }
 
-        // Explicitly reset hardware/digital zoom to minimum (1.0x) if supported by the phone lens
         const videoTrack = stream.getVideoTracks()[0];
         if (videoTrack && typeof videoTrack.getCapabilities === 'function') {
           try {
@@ -211,14 +220,13 @@ export const App: React.FC = () => {
     };
   }, [settings.facingMode, settings.resolution]);
 
-  // Real-time 478 landmark detection + One Euro smoothing + Mesh/Puppet render loop
+  // Real-time 478 landmark detection + Side-Profile Head-Turn Persistence + One Euro smoothing loop
   useEffect(() => {
     let animId = 0;
     const renderLoop = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
       if (canvas) {
-        // Match canvas internal resolution to its exact screen display aspect ratio (prevents CSS double-zoom!)
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
         const targetW = Math.round((canvas.clientWidth || window.innerWidth) * dpr);
         const targetH = Math.round((canvas.clientHeight || window.innerHeight) * dpr);
@@ -247,6 +255,7 @@ export const App: React.FC = () => {
           if (
             landmarkerRef.current &&
             !isStaticDetectingRef.current &&
+            !showVideoSwap &&
             video &&
             video.readyState >= 2 &&
             video.videoWidth > 0
@@ -264,11 +273,16 @@ export const App: React.FC = () => {
                 const ch = canvas.height;
                 const { drawX, drawY, drawW, drawH } = computeVideoDrawRect(cw, ch, vw, vh);
 
+                let minX = 1, minY = 1, maxX = 0, maxY = 0;
                 pts36 = MP_TO_36_INDICES.map((mpIdx, i) => {
                   const pt = lm478[mpIdx] || { x: 0.5, y: 0.5 };
                   const rawX = settings.isMirrored ? 1 - pt.x : pt.x;
                   const canvasNormX = (rawX * drawW + drawX) / cw;
                   const canvasNormY = (pt.y * drawH + drawY) / ch;
+                  if (canvasNormX < minX) minX = canvasNormX;
+                  if (canvasNormY < minY) minY = canvasNormY;
+                  if (canvasNormX > maxX) maxX = canvasNormX;
+                  if (canvasNormY > maxY) maxY = canvasNormY;
                   return filterBankRef.current.filterPoint(
                     i,
                     canvasNormX,
@@ -286,9 +300,9 @@ export const App: React.FC = () => {
                 const re = pts36[15];
                 const nose = pts36[18];
                 const eyeMidX = (le.x + re.x) * 0.5;
-                const eyeDist = Math.max(0.05, Math.hypot(re.x - le.x, re.y - le.y));
+                const eyeDist = Math.max(0.04, Math.hypot(re.x - le.x, re.y - le.y));
                 const rollDeg = (Math.atan2(re.y - le.y, re.x - le.x) * 180) / Math.PI;
-                const yawDeg = ((nose.x - eyeMidX) / eyeDist) * 45;
+                const yawDeg = ((nose.x - eyeMidX) / eyeDist) * 52;
 
                 blendshapes = {
                   jawOpen: filterBankRef.current.filterScalar('jaw', findScore('jawOpen'), settings.smoothingStrength, tSec),
@@ -298,8 +312,49 @@ export const App: React.FC = () => {
                   pitch: 0,
                   roll: filterBankRef.current.filterScalar('roll', rollDeg, settings.smoothingStrength, tSec)
                 };
-              } else if (nowMs - lastTrackedTimeRef.current < 450) {
+
+                lastHeadPoseRef.current = {
+                  centerX: (minX + maxX) * 0.5,
+                  centerY: (minY + maxY) * 0.5,
+                  scale: Math.max(0.18, ((maxX - minX) + (maxY - minY)) * 0.5),
+                  yaw: blendshapes.yaw,
+                  pitch: blendshapes.pitch,
+                  roll: blendshapes.roll,
+                  jawOpen: blendshapes.jawOpen
+                };
+              } else if (nowMs - lastTrackedTimeRef.current < 4500) {
+                // When user turns their head sideways while talking (>45°..80° profile),
+                // keep the swapped face locked onto their head with 3D cylindrical yaw foreshortening!
                 faceDetectedNow = true;
+                const lastPose = lastHeadPoseRef.current;
+                const profileYaw =
+                  Math.abs(lastPose.yaw) > 12
+                    ? Math.sign(lastPose.yaw) * Math.min(62, Math.abs(lastPose.yaw) * 1.18)
+                    : lastPose.yaw;
+
+                pts36 = projectCanonical36ToBox(
+                  lastPose.centerX,
+                  lastPose.centerY,
+                  lastPose.scale,
+                  lastPose.scale * 1.05,
+                  profileYaw,
+                  lastPose.pitch,
+                  lastPose.roll,
+                  lastPose.jawOpen,
+                  0,
+                  0
+                ).map((pt, i) =>
+                  filterBankRef.current.filterPoint(i, pt.x, pt.y, settings.smoothingStrength, tSec)
+                );
+                lastTrackedPtsRef.current = pts36;
+                blendshapes = {
+                  jawOpen: lastPose.jawOpen,
+                  eyeBlinkLeft: 0,
+                  eyeBlinkRight: 0,
+                  yaw: profileYaw,
+                  pitch: lastPose.pitch,
+                  roll: lastPose.roll
+                };
               }
             } catch {
               // Keep last state
@@ -323,13 +378,33 @@ export const App: React.FC = () => {
             settings.detailedMouthInterior,
             settings.showWireframe
           );
+
+          // Update head center from the rendered camera frame during side-profile turns
+          if (faceDetectedNow && nowMs - lastTrackedTimeRef.current >= 120) {
+            const prev = lastHeadPoseRef.current;
+            const est = estimateProfileHeadInCanvas(
+              ctx,
+              canvas.width,
+              canvas.height,
+              prev.centerX,
+              prev.centerY,
+              prev.scale,
+              prev.yaw
+            );
+            lastHeadPoseRef.current = {
+              ...prev,
+              centerX: est.centerX,
+              centerY: est.centerY,
+              yaw: est.yaw
+            };
+          }
         }
       }
       animId = requestAnimationFrame(renderLoop);
     };
     animId = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(animId);
-  }, [selectedChar, settings]);
+  }, [selectedChar, settings, showVideoSwap]);
 
   // Handle Custom Image Upload: First try MediaPipe face detection; if it fails, open Manual Setup!
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
